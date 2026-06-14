@@ -1858,6 +1858,12 @@ If you prefer manual setup, add these to your voxtype config:
 
 ```toml
 [output]
+# Command to run when recording starts
+pre_recording_command = "hyprctl dispatch submap voxtype_recording"
+
+# Command to run when recording stops, before transcription/output
+post_recording_command = "notify-send 'Recording stopped'"
+
 # Command to run BEFORE typing (e.g., switch to modifier-blocking submap)
 pre_output_command = "hyprctl dispatch submap voxtype_suppress"
 
@@ -1873,6 +1879,7 @@ Output hooks are generic shell commands—you can use them for any compositor or
 
 - **Sway**: Use `swaymsg` commands
 - **River**: Use `riverctl` commands
+- **Media ducking**: `pre_recording_command = "voxtype-omarchy-media pause"` and `post_recording_command = "voxtype-omarchy-media resume"`
 - **Notifications**: `pre_output_command = "notify-send 'Typing...'"`
 - **Logging**: `post_output_command = "echo $(date) >> ~/voxtype.log"`
 

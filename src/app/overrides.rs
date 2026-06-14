@@ -275,6 +275,9 @@ pub(crate) fn apply_cli_overrides(config: &mut config::Config, cli: &Cli) -> Opt
     if let Some(ref cmd) = cli.pre_recording_command {
         config.output.pre_recording_command = Some(cmd.clone());
     }
+    if let Some(ref cmd) = cli.post_recording_command {
+        config.output.post_recording_command = Some(cmd.clone());
+    }
     apply_bool_override(
         &mut config.output.wait_for_modifier_release,
         cli.wait_for_modifier_release,

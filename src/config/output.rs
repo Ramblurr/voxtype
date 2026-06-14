@@ -73,6 +73,11 @@ pub struct OutputConfig {
     #[serde(default)]
     pub pre_recording_command: Option<String>,
 
+    /// Command to run when recording stops, before transcription/output begins
+    /// Useful for ending effects that should only last while the mic is open
+    #[serde(default)]
+    pub post_recording_command: Option<String>,
+
     /// Command to run before typing output (e.g., compositor submap switch)
     /// Useful for blocking modifier keys at the compositor level
     #[serde(default)]
@@ -193,6 +198,7 @@ impl Default for OutputConfig {
             shift_enter_newlines: false,
             wtype_shift_prefix: false,
             pre_recording_command: None,
+            post_recording_command: None,
             pre_output_command: None,
             post_output_command: None,
             post_process: None,

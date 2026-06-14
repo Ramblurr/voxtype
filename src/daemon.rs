@@ -962,6 +962,14 @@ impl Daemon {
         }
     }
 
+    async fn run_post_recording_hook(&self) {
+        if let Some(cmd) = &self.config.output.post_recording_command {
+            if let Err(e) = output::run_hook(cmd, "post_recording").await {
+                tracing::warn!("{}", e);
+            }
+        }
+    }
+
     /// Early-stop the streaming capture: cut audio flow to the backend,
     /// start the OSD silence pump so the visualizer stays alive during
     /// drain, and stop the mic. Leaves `streaming_session`/`_chain` for
@@ -971,6 +979,7 @@ impl Daemon {
         self.start_streaming_drain_pump();
         if let Some(mut c) = audio_capture.take() {
             let _ = c.stop().await;
+            self.run_post_recording_hook().await;
         }
     }
 
@@ -984,6 +993,7 @@ impl Daemon {
     ) {
         if let Some(mut c) = audio_capture.take() {
             let _ = c.stop().await;
+            self.run_post_recording_hook().await;
         }
         if let Some(h) = streaming_handle.take() {
             // Don't error on join failure; the task may have already
@@ -1026,6 +1036,7 @@ impl Daemon {
         }
         if let Some(mut c) = audio_capture.take() {
             let _ = c.stop().await;
+            self.run_post_recording_hook().await;
         }
         if let Some(s) = streaming_session.as_mut() {
             if let Err(e) = s.rewind().await {
@@ -1850,7 +1861,9 @@ impl Daemon {
 
         // Stop recording and get samples
         if let Some(mut capture) = audio_capture.take() {
-            match capture.stop().await {
+            let stop_result = capture.stop().await;
+            self.run_post_recording_hook().await;
+            match stop_result {
                 Ok(samples) => {
                     let audio_duration = samples.len() as f32 / 16000.0;
 
@@ -2788,6 +2801,10 @@ impl Daemon {
                                 ).await {
                                     Ok(t) => Some(t),
                                     Err(()) => {
+                                        if let Some(mut capture) = audio_capture.take() {
+                                            let _ = capture.stop().await;
+                                            self.run_post_recording_hook().await;
+                                        }
                                         state = State::Idle;
                                         self.update_state("idle");
                                         continue;
@@ -2824,6 +2841,7 @@ impl Daemon {
                                         }
                                     }
                                 }
+                                self.run_post_recording_hook().await;
 
                                 let transcriber = match self.get_transcriber_for_recording(
                                     model_override.as_deref(),
@@ -2989,6 +3007,10 @@ impl Daemon {
                                 ).await {
                                     Ok(t) => Some(t),
                                     Err(()) => {
+                                        if let Some(mut capture) = audio_capture.take() {
+                                            let _ = capture.stop().await;
+                                            self.run_post_recording_hook().await;
+                                        }
                                         state = State::Idle;
                                         self.update_state("idle");
                                         continue;
@@ -3025,6 +3047,7 @@ impl Daemon {
                                         }
                                     }
                                 }
+                                self.run_post_recording_hook().await;
 
                                 let transcriber = match self.get_transcriber_for_recording(
                                     model_override.as_deref(),
@@ -3077,6 +3100,7 @@ impl Daemon {
                                 if let Some(mut capture) = audio_capture.take() {
                                     let _ = capture.stop().await;
                                 }
+                                self.run_post_recording_hook().await;
 
                                 // Cancel any pending model load task
                                 if let Some(task) = self.model_load_task.take() {
@@ -3152,6 +3176,7 @@ impl Daemon {
                         if let Some(mut capture) = audio_capture.take() {
                             let _ = capture.stop().await;
                         }
+                        self.run_post_recording_hook().await;
 
                         // Cancel any pending model load task
                         if let Some(task) = self.model_load_task.take() {
@@ -3297,6 +3322,10 @@ impl Daemon {
                         ).await {
                             Ok(t) => Some(t),
                             Err(()) => {
+                                if let Some(mut capture) = audio_capture.take() {
+                                    let _ = capture.stop().await;
+                                    self.run_post_recording_hook().await;
+                                }
                                 state = State::Idle;
                                 self.update_state("idle");
                                 continue;
@@ -3311,6 +3340,7 @@ impl Daemon {
                                     }
                                 }
                             }
+                            self.run_post_recording_hook().await;
 
                             if let Some(transcriber) = transcriber {
                                 self.update_state("transcribing");
@@ -3482,6 +3512,10 @@ impl Daemon {
                         ).await {
                             Ok(t) => Some(t),
                             Err(()) => {
+                                if let Some(mut capture) = audio_capture.take() {
+                                    let _ = capture.stop().await;
+                                    self.run_post_recording_hook().await;
+                                }
                                 state = State::Idle;
                                 self.update_state("idle");
                                 continue;
@@ -3517,6 +3551,7 @@ impl Daemon {
                                 }
                             }
                         }
+                        self.run_post_recording_hook().await;
 
                         let transcriber = match self.get_transcriber_for_recording(
                             model_override.as_deref(),

@@ -422,6 +422,15 @@ pub struct Cli {
     )]
     pub pre_recording_command: Option<String>,
 
+    /// Command to run when recording stops, before transcription/output begins
+    #[arg(
+        long,
+        value_name = "CMD",
+        help_heading = "Output",
+        hide_short_help = true
+    )]
+    pub post_recording_command: Option<String>,
+
     /// Wait for modifier keys (Ctrl/Alt/Shift/Super) to be released before typing
     #[arg(
         long,

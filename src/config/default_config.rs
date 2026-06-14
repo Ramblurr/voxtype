@@ -226,9 +226,12 @@ type_delay_ms = 0
 # transcription delivery. (default: 750)
 # modifier_release_timeout_ms = 750
 
-# Pre/post output hooks (optional)
-# Commands to run before and after typing output. Useful for compositor integration.
+# Recording/output hooks (optional)
+# Commands to run at recording/output lifecycle points. Useful for compositor
+# integration and short-lived recording effects such as media ducking.
 # Example: Block modifier keys during typing with Hyprland submap:
+#   pre_recording_command = "hyprctl dispatch submap voxtype_recording"
+#   post_recording_command = "notify-send 'Recording stopped'"
 #   pre_output_command = "hyprctl dispatch submap voxtype_suppress"
 #   post_output_command = "hyprctl dispatch submap reset"
 # See troubleshooting docs for the required Hyprland submap configuration.

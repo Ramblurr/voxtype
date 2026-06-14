@@ -1,0 +1,246 @@
+#!/usr/bin/env bash
+# Duck (lower) the volume of playing media while voxtype records, and
+# restore the original volumes afterwards. Built for Omarchy setups:
+# `omarchy-shell media status` identifies the active player, pactl/jq do
+# the per-stream volume work. gpu-screen-recorder monitor captures are
+# ducked too so recordings don't pick up the media at full level.
+#
+# Wire it up through voxtype's compositor hook commands in config.toml:
+#
+#   [output]
+#   pre_recording_command = "voxtype-omarchy-media pause"
+#   post_recording_command = "voxtype-omarchy-media resume"
+#
+# Tunables (environment): VOXTYPE_OMARCHY_DUCK_VOLUME (default 70%),
+# VOXTYPE_OMARCHY_DUCK_FADE_STEPS (8), VOXTYPE_OMARCHY_DUCK_FADE_STEP_SLEEP (0.03).
+set -euo pipefail
+
+runtime_dir="${XDG_RUNTIME_DIR:-/tmp}/voxtype"
+state_file="$runtime_dir/omarchy-media-ducked.json"
+duck_volume="${VOXTYPE_OMARCHY_DUCK_VOLUME:-70%}"
+fade_steps="${VOXTYPE_OMARCHY_DUCK_FADE_STEPS:-8}"
+fade_step_sleep="${VOXTYPE_OMARCHY_DUCK_FADE_STEP_SLEEP:-0.03}"
+
+status_json() {
+  omarchy-shell media status 2>/dev/null || true
+}
+
+is_playing() {
+  python3 - "$@" <<'PY'
+import json
+import sys
+
+try:
+    data = json.loads(sys.argv[1])
+except Exception:
+    sys.exit(1)
+
+sys.exit(0 if data.get("playing") is True else 1)
+PY
+}
+
+volume_number() {
+  local value="${1%%%}"
+  printf '%s\n' "${value%%.*}"
+}
+
+interpolated_volumes() {
+  local from_list="$1"
+  local to_list="$2"
+  local step="$3"
+  local steps="$4"
+  local from to out i from_num to_num value
+
+  read -r -a from <<<"$from_list"
+  read -r -a to <<<"$to_list"
+
+  if (( ${#from[@]} == 0 )); then
+    return
+  fi
+  # Expand whichever list is shorter so per-channel volumes interpolate
+  # pairwise. Resume passes a single duck volume as "from" against a
+  # multi-channel "to"; without this, unequal L/R balance was lost.
+  if (( ${#to[@]} == 1 && ${#from[@]} > 1 )); then
+    for ((i = 1; i < ${#from[@]}; i++)); do
+      to[i]="${to[0]}"
+    done
+  fi
+  if (( ${#from[@]} == 1 && ${#to[@]} > 1 )); then
+    for ((i = 1; i < ${#to[@]}; i++)); do
+      from[i]="${from[0]}"
+    done
+  fi
+
+  out=()
+  for ((i = 0; i < ${#from[@]}; i++)); do
+    from_num="$(volume_number "${from[i]}")"
+    to_num="$(volume_number "${to[i]:-${to[0]}}")"
+    value=$((from_num + (to_num - from_num) * step / steps))
+    out+=("${value}%")
+  done
+
+  printf '%s\n' "${out[*]}"
+}
+
+fade_volume() {
+  local command="$1"
+  local id="$2"
+  local from_list="$3"
+  local to_list="$4"
+  local step volumes
+
+  if (( fade_steps <= 1 )); then
+    # shellcheck disable=SC2086
+    pactl "$command" "$id" $to_list >/dev/null 2>&1 || true
+    return
+  fi
+
+  for ((step = 1; step <= fade_steps; step++)); do
+    volumes="$(interpolated_volumes "$from_list" "$to_list" "$step" "$fade_steps")"
+    [[ -n "$volumes" ]] || continue
+    # shellcheck disable=SC2086
+    pactl "$command" "$id" $volumes >/dev/null 2>&1 || true
+    if (( step < fade_steps )); then
+      sleep "$fade_step_sleep"
+    fi
+  done
+}
+
+pause_if_playing() {
+  local status
+  status="$(status_json)"
+  if [[ -z "$status" ]] || ! is_playing "$status"; then
+    rm -f "$state_file" 2>/dev/null || true
+    return 0
+  fi
+  if [[ -f "$state_file" ]]; then
+    return 0
+  fi
+
+  command -v pactl >/dev/null 2>&1 || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+
+  mkdir -p "$runtime_dir"
+  local inputs outputs sources state
+  inputs="$(pactl -f json list sink-inputs 2>/dev/null || true)"
+  outputs="$(pactl -f json list source-outputs 2>/dev/null || true)"
+  sources="$(pactl -f json list sources 2>/dev/null || true)"
+  [[ -n "$inputs" ]] || inputs="[]"
+  [[ -n "$outputs" ]] || outputs="[]"
+  [[ -n "$sources" ]] || sources="[]"
+
+  state="$(
+    jq -n \
+      --argjson status "$status" \
+      --argjson inputs "$inputs" \
+      --argjson outputs "$outputs" \
+      --argjson sources "$sources" '
+      def clean: tostring | ascii_downcase;
+      def contains_key($value; $key):
+        ($key | clean | length) > 0 and ($value | clean | contains($key | clean));
+      def prop($stream; $name): $stream.properties[$name] // "";
+      def stream_matches($stream; $identity; $desktop):
+        contains_key(prop($stream; "application.name"); $identity)
+        or contains_key(prop($stream; "application.id"); $identity)
+        or contains_key(prop($stream; "application.process.binary"); $identity)
+        or contains_key(prop($stream; "device.description"); $identity)
+        or contains_key(prop($stream; "node.name"); $identity)
+        or contains_key(prop($stream; "media.name"); $identity)
+        or contains_key(prop($stream; "application.name"); $desktop)
+        or contains_key(prop($stream; "application.id"); $desktop)
+        or contains_key(prop($stream; "application.process.binary"); $desktop)
+        or contains_key(prop($stream; "node.name"); $desktop);
+      def volumes:
+        .volume
+        | to_entries
+        | sort_by(.key)
+        | map(.value.value_percent);
+      def source_by_index($source_id):
+        $sources[]? | select((.index | tostring) == ($source_id | tostring));
+      def is_output_monitor($source_id):
+        source_by_index($source_id) as $source
+        | ($source.monitor_source // "") != ""
+          or (($source.name // "") | clean | endswith(".monitor"))
+          or (($source.description // "") | clean | startswith("monitor of "));
+      def is_screen_recorder($stream):
+        contains_key(prop($stream; "application.name"); "gpu-screen-recorder")
+        or contains_key(prop($stream; "application.name"); "gpu screen recorder")
+        or contains_key(prop($stream; "application.process.binary"); "gpu-screen-recorder")
+        or contains_key(prop($stream; "application.process.binary"); "gpu screen recorder")
+        or contains_key(prop($stream; "application.id"); "gpu-screen-recorder")
+        or contains_key(prop($stream; "application.id"); "gpu screen recorder")
+        or contains_key(prop($stream; "media.name"); "gpu-screen-recorder");
+
+      ($status.identity // "") as $identity
+      | ($status.desktopEntry // "") as $desktop
+      | ($inputs | map(select(.mute == false and .corked == false))) as $live
+      | ($live | map(select(stream_matches(.; $identity; $desktop)))) as $matched
+      | {
+          sink_inputs: (
+            if ($matched | length) > 0 then $matched elif ($live | length) == 1 then $live else [] end
+            | map({ index, volumes: volumes })
+          ),
+          source_outputs: (
+            $outputs
+            | map(select(.mute == false and .corked == false))
+            | map(select(is_screen_recorder(.) and is_output_monitor(.source)))
+            | map({ index, volumes: volumes })
+          )
+        }
+    '
+  )"
+
+  [[ "$(jq -r '((.sink_inputs // []) + (.source_outputs // [])) | length' <<<"$state")" != "0" ]] || return 0
+
+  printf '%s\n' "$state" >"$state_file"
+  while IFS=$'\t' read -r id volumes; do
+    [[ -n "$id" && -n "$volumes" ]] || continue
+    fade_volume set-sink-input-volume "$id" "$volumes" "$duck_volume"
+  done < <(
+    jq -r '.sink_inputs[]? | [.index, (.volumes | join(" "))] | @tsv' <<<"$state"
+  )
+  while IFS=$'\t' read -r id volumes; do
+    [[ -n "$id" && -n "$volumes" ]] || continue
+    fade_volume set-source-output-volume "$id" "$volumes" "$duck_volume"
+  done < <(
+    jq -r '.source_outputs[]? | [.index, (.volumes | join(" "))] | @tsv' <<<"$state"
+  )
+}
+
+resume_if_paused() {
+  [[ -f "$state_file" ]] || return 0
+  command -v pactl >/dev/null 2>&1 || {
+    rm -f "$state_file" 2>/dev/null || true
+    return 0
+  }
+
+  local state
+  state="$(cat "$state_file" 2>/dev/null || true)"
+  if [[ -n "$state" ]]; then
+    while IFS=$'\t' read -r id volumes; do
+      [[ -n "$id" && -n "$volumes" ]] || continue
+      fade_volume set-sink-input-volume "$id" "$duck_volume" "$volumes"
+    done < <(
+      jq -r '
+        if type == "array" then .[] else .sink_inputs[]? end
+        | [.index, (.volumes | join(" "))] | @tsv
+      ' <<<"$state" 2>/dev/null || true
+    )
+    while IFS=$'\t' read -r id volumes; do
+      [[ -n "$id" && -n "$volumes" ]] || continue
+      fade_volume set-source-output-volume "$id" "$duck_volume" "$volumes"
+    done < <(
+      jq -r '.source_outputs[]? | [.index, (.volumes | join(" "))] | @tsv' <<<"$state" 2>/dev/null || true
+    )
+  fi
+  rm -f "$state_file" 2>/dev/null || true
+}
+
+case "${1:-}" in
+  pause) pause_if_playing ;;
+  resume) resume_if_paused ;;
+  *)
+    printf 'usage: %s pause|resume\n' "$0" >&2
+    exit 2
+    ;;
+esac
