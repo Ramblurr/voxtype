@@ -29,6 +29,14 @@ pub struct AudioConfig {
     #[serde(default)]
     pub pause_media_ignored_players: Vec<String>,
 
+    /// Lower active media stream volume during recording and restore on stop
+    #[serde(default)]
+    pub duck_media: bool,
+
+    /// Target volume percentage for media ducking
+    #[serde(default = "default_duck_media_volume_percent")]
+    pub duck_media_volume_percent: u8,
+
     /// Audio feedback settings
     #[serde(default)]
     pub feedback: AudioFeedbackConfig,
@@ -42,6 +50,8 @@ impl Default for AudioConfig {
             max_duration_secs: default_audio_max_duration_secs(),
             pause_media: false,
             pause_media_ignored_players: Vec::new(),
+            duck_media: false,
+            duck_media_volume_percent: default_duck_media_volume_percent(),
             feedback: AudioFeedbackConfig::default(),
         }
     }
@@ -57,6 +67,10 @@ fn default_audio_sample_rate() -> u32 {
 
 fn default_audio_max_duration_secs() -> u32 {
     60
+}
+
+fn default_duck_media_volume_percent() -> u8 {
+    70
 }
 
 /// Audio feedback configuration for sound cues

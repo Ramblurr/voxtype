@@ -60,6 +60,12 @@ max_duration_secs = 60
 # ignoring browsers whose MPRIS status is unreliable.
 # pause_media_ignored_players = ["chromium", "firefox"]
 
+# Lower active media stream volume while recording, then restore it as soon as
+# recording stops. This is separate from pause_media; enable one behavior or
+# the other depending on whether you want media paused or only quieter.
+# duck_media = false
+# duck_media_volume_percent = 70
+
 # [audio.feedback]
 # Enable audio feedback sounds (beeps when recording starts/stops)
 # enabled = true
@@ -226,12 +232,10 @@ type_delay_ms = 0
 # transcription delivery. (default: 750)
 # modifier_release_timeout_ms = 750
 
-# Recording/output hooks (optional)
-# Commands to run at recording/output lifecycle points. Useful for compositor
-# integration and short-lived recording effects such as media ducking.
+# Pre/post output hooks (optional)
+# Commands to run before and after typing output. Useful for compositor integration.
 # Example: Block modifier keys during typing with Hyprland submap:
 #   pre_recording_command = "hyprctl dispatch submap voxtype_recording"
-#   post_recording_command = "notify-send 'Recording stopped'"
 #   pre_output_command = "hyprctl dispatch submap voxtype_suppress"
 #   post_output_command = "hyprctl dispatch submap reset"
 # See troubleshooting docs for the required Hyprland submap configuration.

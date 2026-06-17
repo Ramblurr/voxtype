@@ -153,7 +153,7 @@ sets the window class to `voxtype` so compositors can float it.
 | General | Active engine, variant binary, daemon status, hardware-aware variant recommendation |
 | Engine | Per-engine tuning for Whisper / Parakeet / Moonshine / SenseVoice / Paraformer / Dolphin / Omnilingual / Cohere |
 | Hotkey | PTT key, mode (PTT vs toggle), cancel key, modifier key, evdev-listener toggle |
-| Audio | Input device, max recording length, MPRIS-pause, audio feedback theme/volume |
+| Audio | Input device, max recording length, MPRIS pause/ducking, audio feedback theme/volume |
 | Output | Mode (type/clipboard/paste/file), driver order, auto-submit, post-process command |
 | Text | Spoken-punctuation toggle, smart-auto-submit, custom replacements list editor |
 | VAD | Silero VAD enable, backend (auto/energy/whisper), threshold |
@@ -413,6 +413,12 @@ sample_rate = 16000
 # Maximum recording duration in seconds (safety limit)
 # Recording automatically stops and transcribes after this time
 max_duration_secs = 60
+
+# Optional media behavior while recording
+# pause_media pauses MPRIS players; duck_media lowers active stream volume
+# pause_media = false
+# duck_media = false
+# duck_media_volume_percent = 70
 
 [whisper]
 # Model to use for transcription
@@ -1861,9 +1867,6 @@ If you prefer manual setup, add these to your voxtype config:
 # Command to run when recording starts
 pre_recording_command = "hyprctl dispatch submap voxtype_recording"
 
-# Command to run when recording stops, before transcription/output
-post_recording_command = "notify-send 'Recording stopped'"
-
 # Command to run BEFORE typing (e.g., switch to modifier-blocking submap)
 pre_output_command = "hyprctl dispatch submap voxtype_suppress"
 
@@ -1879,7 +1882,6 @@ Output hooks are generic shell commands—you can use them for any compositor or
 
 - **Sway**: Use `swaymsg` commands
 - **River**: Use `riverctl` commands
-- **Media ducking**: `pre_recording_command = "voxtype-omarchy-media pause"` and `post_recording_command = "voxtype-omarchy-media resume"`
 - **Notifications**: `pre_output_command = "notify-send 'Typing...'"`
 - **Logging**: `post_output_command = "echo $(date) >> ~/voxtype.log"`
 

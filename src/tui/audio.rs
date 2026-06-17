@@ -1,4 +1,4 @@
-//! Audio settings: input device, max duration, feedback sounds, MPRIS pause.
+//! Audio settings: input device, max duration, media behavior, feedback sounds.
 
 use cpal::traits::{DeviceTrait, HostTrait};
 use crossterm::event::{KeyCode, KeyEvent};
@@ -21,6 +21,8 @@ pub struct AudioState {
     pub device: String,
     pub max_duration_secs: u32,
     pub pause_media: bool,
+    pub duck_media: bool,
+    pub duck_media_volume_percent: u8,
     pub feedback_enabled: bool,
     pub feedback_theme: String,
     pub feedback_volume: f32,
@@ -56,6 +58,8 @@ pub enum Field {
     Device,
     MaxDuration,
     PauseMedia,
+    DuckMedia,
+    DuckMediaVolume,
     FeedbackEnabled,
     FeedbackTheme,
     FeedbackVolume,
@@ -66,6 +70,8 @@ impl Field {
         Field::Device,
         Field::MaxDuration,
         Field::PauseMedia,
+        Field::DuckMedia,
+        Field::DuckMediaVolume,
         Field::FeedbackEnabled,
         Field::FeedbackTheme,
         Field::FeedbackVolume,
@@ -78,6 +84,7 @@ const DURATION_STEP: u32 = 30;
 const DURATION_MIN: u32 = 30;
 const DURATION_MAX: u32 = 1800;
 const VOLUME_STEP: f32 = 0.1;
+const DUCK_VOLUME_STEP: i32 = 5;
 
 impl AudioState {
     pub fn load() -> Result<Self, EditorError> {
@@ -91,6 +98,11 @@ impl AudioState {
                 .map(|n| n.clamp(0, u32::MAX as i64) as u32)
                 .unwrap_or(120),
             pause_media: ed.get_bool("audio", "pause_media").unwrap_or(false),
+            duck_media: ed.get_bool("audio", "duck_media").unwrap_or(false),
+            duck_media_volume_percent: ed
+                .get_int("audio", "duck_media_volume_percent")
+                .map(|n| n.clamp(0, 150) as u8)
+                .unwrap_or(70),
             feedback_enabled: ed.get_bool("audio.feedback", "enabled").unwrap_or(false),
             feedback_theme: ed
                 .get_string("audio.feedback", "theme")
@@ -146,6 +158,12 @@ impl AudioState {
         ed.set_string("audio", "device", &self.device);
         ed.set_int("audio", "max_duration_secs", self.max_duration_secs as i64);
         ed.set_bool("audio", "pause_media", self.pause_media);
+        ed.set_bool("audio", "duck_media", self.duck_media);
+        ed.set_int(
+            "audio",
+            "duck_media_volume_percent",
+            self.duck_media_volume_percent as i64,
+        );
         ed.set_bool("audio.feedback", "enabled", self.feedback_enabled);
         ed.set_string("audio.feedback", "theme", &self.feedback_theme);
         ed.set_f32("audio.feedback", "volume", self.feedback_volume);
@@ -221,6 +239,13 @@ impl AudioState {
             }
             Field::PauseMedia => {
                 self.pause_media = !self.pause_media;
+            }
+            Field::DuckMedia => {
+                self.duck_media = !self.duck_media;
+            }
+            Field::DuckMediaVolume => {
+                let next = self.duck_media_volume_percent as i32 + delta * DUCK_VOLUME_STEP;
+                self.duck_media_volume_percent = next.clamp(0, 150) as u8;
             }
             Field::FeedbackEnabled => {
                 self.feedback_enabled = !self.feedback_enabled;
@@ -339,6 +364,17 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
             yesno(state.pause_media),
         ),
         FormRowSpec::new(
+            state.field == Field::DuckMedia,
+            "Duck media volume on record",
+            yesno(state.duck_media),
+        ),
+        FormRowSpec::new(
+            state.field == Field::DuckMediaVolume,
+            "Ducked media volume",
+            format!("{}%", state.duck_media_volume_percent),
+        )
+        .dimmed(!state.duck_media),
+        FormRowSpec::new(
             state.field == Field::FeedbackEnabled,
             "Audio feedback sounds",
             if state.feedback_enabled { "on" } else { "off" },
@@ -445,7 +481,7 @@ fn guidance_for_field(state: &AudioState) -> Vec<Line<'_>> {
             ),
             Line::from(""),
             Line::from(Span::styled(
-                "Requires playerctl to be installed.",
+                "Uses MPRIS over the session D-Bus.",
                 Style::default().fg(Color::Gray),
             )),
             Line::from(""),
@@ -454,6 +490,34 @@ fn guidance_for_field(state: &AudioState) -> Vec<Line<'_>> {
                  mic, or if you'd rather hear yourself dictate without \
                  lyrics in the way.",
             ),
+        ],
+        Field::DuckMedia => vec![
+            heading("Duck media volume on record"),
+            Line::from(""),
+            Line::from(
+                "Lowers active PulseAudio/PipeWire sink-input volume while \
+                 you record, then restores the original volume as soon as \
+                 recording stops.",
+            ),
+            Line::from(""),
+            Line::from(
+                "Use this instead of pause media when you want playback to \
+                 continue quietly during push-to-talk.",
+            ),
+        ],
+        Field::DuckMediaVolume => vec![
+            heading("Ducked media volume"),
+            Line::from(""),
+            Line::from(
+                "Target volume for active media streams while recording. \
+                 The original per-channel volumes are restored when the mic \
+                 closes.",
+            ),
+            Line::from(""),
+            Line::from(Span::styled(
+                "0% is silence; 70% is a light duck; values above 100% amplify.",
+                Style::default().fg(Color::Gray),
+            )),
         ],
         Field::FeedbackEnabled => vec![
             heading("Audio feedback sounds"),

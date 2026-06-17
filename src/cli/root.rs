@@ -236,9 +236,22 @@ pub struct Cli {
     )]
     pub no_audio_feedback: bool,
 
-    /// Pause MPRIS media players during recording (requires playerctl)
+    /// Pause MPRIS media players during recording
     #[arg(long, help_heading = "Audio", hide_short_help = true)]
     pub pause_media: bool,
+
+    /// Lower active media volume during recording instead of pausing it
+    #[arg(long, help_heading = "Audio", hide_short_help = true)]
+    pub duck_media: bool,
+
+    /// Target media volume percentage while ducking
+    #[arg(
+        long,
+        value_name = "PERCENT",
+        help_heading = "Audio",
+        hide_short_help = true
+    )]
+    pub duck_media_volume: Option<u8>,
 
     // -- Output (delivery, timing, file output, hooks) --
     /// Force clipboard mode (don't try to type)
@@ -421,15 +434,6 @@ pub struct Cli {
         hide_short_help = true
     )]
     pub pre_recording_command: Option<String>,
-
-    /// Command to run when recording stops, before transcription/output begins
-    #[arg(
-        long,
-        value_name = "CMD",
-        help_heading = "Output",
-        hide_short_help = true
-    )]
-    pub post_recording_command: Option<String>,
 
     /// Wait for modifier keys (Ctrl/Alt/Shift/Super) to be released before typing
     #[arg(

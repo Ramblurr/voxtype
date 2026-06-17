@@ -369,6 +369,43 @@ Maximum recording duration in seconds. Recording automatically stops after this 
 max_duration_secs = 120  # Allow 2-minute recordings
 ```
 
+### pause_media
+
+**Type:** Boolean
+**Default:** `false`
+**Required:** No
+
+When `true`, pauses currently playing MPRIS media players when recording starts and resumes only those players after output completes.
+
+```toml
+[audio]
+pause_media = true
+```
+
+### duck_media
+
+**Type:** Boolean
+**Default:** `false`
+**Required:** No
+
+When `true`, lowers active media stream volume when recording starts and restores the original volume as soon as recording stops, before transcription or output processing.
+
+Use this as an alternative to `pause_media` when you want music or video to keep playing quietly during push-to-talk.
+
+```toml
+[audio]
+duck_media = true
+duck_media_volume_percent = 70
+```
+
+### duck_media_volume_percent
+
+**Type:** Integer
+**Default:** `70`
+**Required:** No
+
+Target volume percentage for streams affected by `duck_media`. Values above `150` are clamped by the CLI override.
+
 ---
 
 ## [audio.feedback]
@@ -2247,25 +2284,6 @@ voxtype --wtype-shift-prefix daemon
 
 See [Troubleshooting](TROUBLESHOOTING.md#first-cjk-character-dropped-wtype) for more details.
 
-### post_recording_command
-
-**Type:** String
-**Default:** None (disabled)
-**Required:** No
-
-Shell command to execute immediately after recording capture stops, before transcription, post-processing, or text output begins.
-
-**Primary use case:** End effects that should only last while the microphone is open, such as media ducking, visual recording indicators, or temporary compositor modes.
-
-**Example:**
-```toml
-[output]
-pre_recording_command = "voxtype-omarchy-media pause"
-post_recording_command = "voxtype-omarchy-media resume"
-```
-
-Use `post_output_command` instead for cleanup that must happen after text has actually been typed or pasted.
-
 ### pre_output_command
 
 **Type:** String
@@ -2312,9 +2330,6 @@ post_output_command = "hyprctl dispatch submap reset"
 **Other uses:**
 ```toml
 [output]
-# Stop recording-only effects before decode/output begins
-post_recording_command = "voxtype-omarchy-media resume"
-
 # Notification when typing starts/finishes
 pre_output_command = "notify-send 'Typing...'"
 post_output_command = "notify-send 'Done'"

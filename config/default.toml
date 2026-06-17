@@ -62,6 +62,12 @@ sample_rate = 16000
 # Maximum recording duration in seconds (safety limit)
 max_duration_secs = 60
 
+# Lower active media stream volume while recording, then restore it as soon as
+# recording stops. This is separate from pause_media; enable one behavior or
+# the other depending on whether you want media paused or only quieter.
+# duck_media = false
+# duck_media_volume_percent = 70
+
 # [audio.feedback]
 # Enable audio feedback sounds (beeps when recording starts/stops)
 # enabled = true
@@ -175,15 +181,12 @@ pre_type_delay_ms = 0
 #
 # pre_recording_command: Runs when recording starts. Switch to a submap/mode
 #   where F12 can cancel recording/transcription.
-# post_recording_command: Runs when recording stops, before transcription or
-#   output begins. Use for effects that should only last while the mic is open.
 # pre_output_command: Runs before typing output. Switch to a submap/mode that
 #   blocks modifier keys from triggering compositor shortcuts during typing.
 # post_output_command: Runs after typing output. Reset to normal mode.
 #
 # Example (Hyprland):
 # pre_recording_command = "hyprctl dispatch submap voxtype_recording"
-# post_recording_command = "notify-send 'Recording stopped'"
 # pre_output_command = "hyprctl dispatch submap voxtype_suppress"
 # post_output_command = "hyprctl dispatch submap reset"
 

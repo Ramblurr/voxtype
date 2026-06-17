@@ -185,6 +185,12 @@ pub(crate) fn apply_cli_overrides(config: &mut config::Config, cli: &Cli) -> Opt
     if cli.pause_media {
         config.audio.pause_media = true;
     }
+    if cli.duck_media {
+        config.audio.duck_media = true;
+    }
+    if let Some(volume) = cli.duck_media_volume {
+        config.audio.duck_media_volume_percent = volume.min(150);
+    }
 
     // Output overrides
     if let Some(ref append_text) = cli.append_text {
@@ -274,9 +280,6 @@ pub(crate) fn apply_cli_overrides(config: &mut config::Config, cli: &Cli) -> Opt
     }
     if let Some(ref cmd) = cli.pre_recording_command {
         config.output.pre_recording_command = Some(cmd.clone());
-    }
-    if let Some(ref cmd) = cli.post_recording_command {
-        config.output.post_recording_command = Some(cmd.clone());
     }
     apply_bool_override(
         &mut config.output.wait_for_modifier_release,
