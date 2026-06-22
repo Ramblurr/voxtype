@@ -238,6 +238,7 @@ Self-contained binary for distros that don't have a packaged voxtype.
 ```bash
 wget https://github.com/peteonrails/voxtype/releases/download/v0.7.5/voxtype-0.7.5-x86_64.AppImage
 chmod +x voxtype-0.7.5-x86_64.AppImage
+mkdir -p ~/.local/bin
 mv voxtype-0.7.5-x86_64.AppImage ~/.local/bin/voxtype
 ```
 
