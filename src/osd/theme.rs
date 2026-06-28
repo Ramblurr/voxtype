@@ -1,10 +1,11 @@
 //! Omarchy theme integration.
 //!
 //! On startup, both OSD frontends read the active Omarchy theme and map it
-//! to a [`Palette`] used by the renderer. The active theme lives at
-//! `~/.config/omarchy/current/theme/colors.toml`, which is a TOML file with
-//! a flat structure: `background`, `foreground`, `accent`, plus the ANSI
-//! palette `color0`..=`color15`.
+//! to a [`Palette`] used by the renderer. The active theme usually lives at
+//! `~/.local/state/omarchy/current/theme/colors.toml`, with older installs
+//! using `~/.config/omarchy/current/theme/colors.toml`. The colors file has a
+//! flat structure: `background`, `foreground`, `accent`, plus the ANSI palette
+//! `color0`..=`color15`.
 //!
 //! Mapping:
 //!
@@ -26,12 +27,19 @@ use serde::Deserialize;
 
 use crate::osd::visual::{Color, Palette};
 
-/// Canonical Omarchy "current theme" directory.
-pub fn omarchy_theme_dir() -> Option<PathBuf> {
+/// Candidate Omarchy "current theme" directories, ordered newest to oldest.
+pub fn omarchy_theme_dirs() -> Option<Vec<PathBuf>> {
     let home = std::env::var_os("HOME")?;
-    let mut p = PathBuf::from(home);
-    p.push(".config/omarchy/current/theme");
-    Some(p)
+    let home = PathBuf::from(home);
+    Some(vec![
+        home.join(".local/state/omarchy/current/theme"),
+        home.join(".config/omarchy/current/theme"),
+    ])
+}
+
+/// Preferred Omarchy "current theme" directory.
+pub fn omarchy_theme_dir() -> Option<PathBuf> {
+    omarchy_theme_dirs()?.into_iter().next()
 }
 
 #[derive(Deserialize, Default)]
@@ -63,20 +71,21 @@ fn parse_hex(s: &str) -> Option<Color> {
 /// fallbacks apply too: a theme that only defines `accent` keeps the
 /// fallback values for everything else.
 pub fn load_palette() -> Palette {
-    let Some(dir) = omarchy_theme_dir() else {
+    let Some(dirs) = omarchy_theme_dirs() else {
         return Palette::fallback();
     };
-    let path = dir.join("colors.toml");
-    let content = match fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(_) => return Palette::fallback(),
-    };
-    let parsed: OmarchyColors = match toml::from_str(&content) {
-        Ok(v) => v,
-        Err(_) => return Palette::fallback(),
-    };
 
-    palette_from(parsed)
+    for path in dirs.into_iter().map(|dir| dir.join("colors.toml")) {
+        let Ok(content) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(parsed) = toml::from_str(&content) else {
+            continue;
+        };
+        return palette_from(parsed);
+    }
+
+    Palette::fallback()
 }
 
 fn palette_from(c: OmarchyColors) -> Palette {
@@ -149,7 +158,15 @@ mod tests {
     fn theme_dir_resolves_under_home() {
         std::env::set_var("HOME", "/tmp/fakehome");
         let p = omarchy_theme_dir().unwrap();
-        assert!(p.ends_with(".config/omarchy/current/theme"));
+        assert!(p.ends_with(".local/state/omarchy/current/theme"));
+    }
+
+    #[test]
+    fn theme_dirs_include_legacy_config_fallback() {
+        std::env::set_var("HOME", "/tmp/fakehome");
+        let dirs = omarchy_theme_dirs().unwrap();
+        assert!(dirs[0].ends_with(".local/state/omarchy/current/theme"));
+        assert!(dirs[1].ends_with(".config/omarchy/current/theme"));
     }
 
     #[test]

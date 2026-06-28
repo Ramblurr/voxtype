@@ -10,8 +10,9 @@ pragma Singleton
 //   import "voxtype-shared" as VT
 //   VT.Theme.accentColor = "#6E89C2"
 //
-// Wave 2 will add a loader that reads
-// `~/.config/omarchy/current/theme/colors.toml` and maps `accent`,
+// Wave 2 will add a loader that reads the active Omarchy theme colors from
+// `~/.local/state/omarchy/current/theme/colors.toml`, falling back to the
+// legacy `~/.config/omarchy/current/theme/colors.toml`, and maps `accent`,
 // `background`, `color1`/`2`/`3` onto these properties.
 
 import QtQuick
