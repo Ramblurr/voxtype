@@ -55,6 +55,7 @@
           "paraformer"
           "dolphin"
           "omnilingual"
+          "cohere"
         ];
 
         onnxCudaFeatures = [
@@ -65,6 +66,7 @@
           "paraformer-cuda"
           "dolphin-cuda"
           "omnilingual-cuda"
+          "cohere-cuda"
         ];
 
         # Only Parakeet has AMD GPU support (via MIGraphX); other engines run on CPU
