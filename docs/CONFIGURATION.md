@@ -404,7 +404,11 @@ duck_media_volume_percent = 70
 **Default:** `70`
 **Required:** No
 
-Target volume percentage for streams affected by `duck_media`. Values above `150` are clamped by the CLI override.
+Relative volume percentage for streams affected by `duck_media`. The value is
+applied to each stream's current per-channel volume, not to a fixed 100% base:
+`70` keeps media at 70% of its current volume, `50` keeps it at half, and the
+original per-channel volumes are restored when recording stops. Values above
+`150` are clamped by the CLI override.
 
 ---
 
@@ -3245,6 +3249,9 @@ Any config file setting can be overridden via environment variable. These are ap
 |----------|------|-------------------|
 | `VOXTYPE_AUDIO_DEVICE` | string | `audio.device` |
 | `VOXTYPE_MAX_DURATION_SECS` | integer | `audio.max_duration_secs` |
+| `VOXTYPE_PAUSE_MEDIA` | bool | `audio.pause_media` |
+| `VOXTYPE_DUCK_MEDIA` | bool | `audio.duck_media` |
+| `VOXTYPE_DUCK_MEDIA_VOLUME_PERCENT` | integer | `audio.duck_media_volume_percent` |
 | `VOXTYPE_AUDIO_FEEDBACK` | bool | `audio.feedback.enabled` |
 
 **Output:**

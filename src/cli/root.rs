@@ -244,7 +244,7 @@ pub struct Cli {
     #[arg(long, help_heading = "Audio", hide_short_help = true)]
     pub duck_media: bool,
 
-    /// Target media volume percentage while ducking
+    /// Relative media volume percentage while ducking
     #[arg(
         long,
         value_name = "PERCENT",

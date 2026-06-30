@@ -509,13 +509,13 @@ fn guidance_for_field(state: &AudioState) -> Vec<Line<'_>> {
             heading("Ducked media volume"),
             Line::from(""),
             Line::from(
-                "Target volume for active media streams while recording. \
-                 The original per-channel volumes are restored when the mic \
-                 closes.",
+                "Relative volume for active media streams while recording. \
+                 50% keeps each stream at half its current level; original \
+                 per-channel volumes are restored when the mic closes.",
             ),
             Line::from(""),
             Line::from(Span::styled(
-                "0% is silence; 70% is a light duck; values above 100% amplify.",
+                "0% is silence; 70% keeps 70% of the current level; values above 100% amplify.",
                 Style::default().fg(Color::Gray),
             )),
         ],

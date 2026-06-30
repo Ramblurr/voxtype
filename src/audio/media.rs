@@ -134,14 +134,21 @@ mod imp {
             return Vec::new();
         }
 
-        let target = format!("{}%", volume_percent.min(150));
+        let factor = volume_percent.min(150);
         let mut ducked = Vec::new();
         for stream in streams {
-            debug!(stream = stream.index, volume = %target, "Ducking media stream");
+            let target = scaled_volumes(&stream.volumes, factor);
+            debug!(
+                stream = stream.index,
+                from = ?stream.volumes,
+                to = ?target,
+                factor_percent = factor,
+                "Ducking media stream"
+            );
             match Command::new("pactl")
                 .arg("set-sink-input-volume")
                 .arg(stream.index.to_string())
-                .arg(&target)
+                .args(&target)
                 .status()
                 .await
             {
@@ -257,6 +264,20 @@ mod imp {
             .collect()
     }
 
+    fn scaled_volumes(volumes: &[String], factor_percent: u8) -> Vec<String> {
+        volumes
+            .iter()
+            .map(|volume| {
+                let numeric = volume.trim().trim_end_matches('%');
+                let Ok(value) = numeric.parse::<f32>() else {
+                    return volume.clone();
+                };
+                let scaled = value * f32::from(factor_percent) / 100.0;
+                format!("{scaled:.0}%")
+            })
+            .collect()
+    }
+
     async fn list_mpris_players(
         conn: &Connection,
         ignored: &[String],
@@ -354,6 +375,18 @@ mod imp {
             assert_eq!(streams.len(), 1);
             assert_eq!(streams[0].index, 42);
             assert_eq!(streams[0].volumes, vec!["75%", "80%"]);
+        }
+
+        #[test]
+        fn scales_stream_volumes_relative_to_current_values() {
+            assert_eq!(
+                scaled_volumes(&["100%".to_string(), "80%".to_string()], 70),
+                vec!["70%", "56%"]
+            );
+            assert_eq!(
+                scaled_volumes(&["50%".to_string(), "25%".to_string()], 30),
+                vec!["15%", "8%"]
+            );
         }
     }
 }
