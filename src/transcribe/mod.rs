@@ -5,6 +5,7 @@
 //! - Remote OpenAI-compatible Whisper API (whisper.cpp server, OpenAI, etc.)
 //! - CLI subprocess using whisper-cli (fallback for glibc 2.42+ compatibility)
 //! - Subprocess isolation for GPU memory release
+//! - Optionally ElevenLabs Scribe cloud transcription (when `elevenlabs` feature is enabled)
 //! - Optionally NVIDIA Parakeet via ONNX Runtime (when `parakeet` feature is enabled)
 //! - Optionally Moonshine via ONNX Runtime (when `moonshine` feature is enabled)
 //! - Optionally SenseVoice via ONNX Runtime (when `sensevoice` feature is enabled)
@@ -13,6 +14,8 @@
 //! - Optionally Omnilingual via ONNX Runtime (when `omnilingual` feature is enabled)
 
 pub mod cli;
+#[cfg(feature = "elevenlabs")]
+mod elevenlabs;
 #[cfg(feature = "parakeet")]
 pub mod parakeet_streaming;
 pub mod remote;
