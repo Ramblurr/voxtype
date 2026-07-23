@@ -485,6 +485,26 @@ language_hints = ["en"]
 
 See [SONIOX.md](SONIOX.md) for the full reference (realtime vs async modes, performance tips with dotoold, privacy considerations).
 
+### Cloud Backend: ElevenLabs
+
+ElevenLabs Scribe supports three modes: batch transcription after release, committed-only realtime typing, and provisional partial typing.
+
+Build with `--features elevenlabs`, set `ELEVENLABS_API_KEY`, and choose a mode:
+
+```toml
+engine = "elevenlabs"
+
+[hotkey]
+mode = "toggle"
+
+[elevenlabs]
+mode = "partials"
+vad_silence_threshold_secs = 0.8
+```
+
+Use `mode = "realtime"` for stable committed segments or `mode = "batch"` for one transcript after release. See [CONFIGURATION.md](CONFIGURATION.md#elevenlabs) for every option.
+
+
 ### Creating a Custom Configuration
 
 ```bash

@@ -10,6 +10,17 @@ use clap::Parser;
 use super::Commands;
 use super::ENGINE_NAMES_CSV;
 
+fn parse_positive_f32(value: &str) -> Result<f32, String> {
+    let parsed = value
+        .parse::<f32>()
+        .map_err(|_| format!("'{value}' is not a number"))?;
+    if parsed.is_finite() && parsed > 0.0 {
+        Ok(parsed)
+    } else {
+        Err("value must be a positive finite number".to_string())
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "voxtype")]
 #[command(author, version, about = "Push-to-talk voice-to-text for Linux")]
@@ -217,12 +228,38 @@ pub struct Cli {
     )]
     pub elevenlabs_language: Option<String>,
 
+    /// ElevenLabs dictation mode: batch, realtime, or partials
+    #[arg(
+        long,
+        value_name = "MODE",
+        value_parser = ["batch", "realtime", "partials"],
+        help_heading = "ElevenLabs",
+        hide_short_help = true,
+        conflicts_with_all = [
+            "elevenlabs_streaming",
+            "no_elevenlabs_streaming",
+            "elevenlabs_type_partials",
+            "no_elevenlabs_type_partials",
+        ]
+    )]
+    pub elevenlabs_mode: Option<String>,
+
+    /// Seconds of silence before ElevenLabs commits a realtime segment
+    #[arg(
+        long,
+        value_name = "SECS",
+        value_parser = parse_positive_f32,
+        help_heading = "ElevenLabs",
+        hide_short_help = true
+    )]
+    pub elevenlabs_vad_silence_threshold_secs: Option<f32>,
+
     /// Use ElevenLabs realtime transcription for dictation
     #[arg(
         long,
         help_heading = "ElevenLabs",
         hide_short_help = true,
-        conflicts_with = "no_elevenlabs_streaming"
+        conflicts_with_all = ["no_elevenlabs_streaming", "elevenlabs_mode"]
     )]
     pub elevenlabs_streaming: bool,
 
@@ -231,7 +268,7 @@ pub struct Cli {
         long,
         help_heading = "ElevenLabs",
         hide_short_help = true,
-        conflicts_with = "elevenlabs_streaming"
+        conflicts_with_all = ["elevenlabs_streaming", "elevenlabs_mode"]
     )]
     pub no_elevenlabs_streaming: bool,
 
@@ -240,7 +277,7 @@ pub struct Cli {
         long,
         help_heading = "ElevenLabs",
         hide_short_help = true,
-        conflicts_with = "no_elevenlabs_type_partials"
+        conflicts_with_all = ["no_elevenlabs_type_partials", "elevenlabs_mode"]
     )]
     pub elevenlabs_type_partials: bool,
 
@@ -249,7 +286,7 @@ pub struct Cli {
         long,
         help_heading = "ElevenLabs",
         hide_short_help = true,
-        conflicts_with = "elevenlabs_type_partials"
+        conflicts_with_all = ["elevenlabs_type_partials", "elevenlabs_mode"]
     )]
     pub no_elevenlabs_type_partials: bool,
 

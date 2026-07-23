@@ -175,6 +175,8 @@ pub(crate) fn apply_cli_overrides(config: &mut config::Config, cli: &Cli) -> Opt
     if cli.elevenlabs_api_key.is_some()
         || cli.elevenlabs_region.is_some()
         || cli.elevenlabs_language.is_some()
+        || cli.elevenlabs_mode.is_some()
+        || cli.elevenlabs_vad_silence_threshold_secs.is_some()
         || cli.elevenlabs_streaming
         || cli.no_elevenlabs_streaming
         || cli.elevenlabs_type_partials
@@ -195,16 +197,32 @@ pub(crate) fn apply_cli_overrides(config: &mut config::Config, cli: &Cli) -> Opt
         if let Some(ref language) = cli.elevenlabs_language {
             elevenlabs.set_language_code(language);
         }
-        apply_bool_override(
-            &mut elevenlabs.streaming,
-            cli.elevenlabs_streaming,
-            cli.no_elevenlabs_streaming,
-        );
-        apply_bool_override(
-            &mut elevenlabs.type_partials,
-            cli.elevenlabs_type_partials,
-            cli.no_elevenlabs_type_partials,
-        );
+        if let Some(ref mode) = cli.elevenlabs_mode {
+            elevenlabs.mode = mode
+                .parse::<config::ElevenLabsMode>()
+                .expect("validated ElevenLabs mode");
+        } else {
+            let streaming = if cli.elevenlabs_streaming {
+                Some(true)
+            } else if cli.no_elevenlabs_streaming {
+                Some(false)
+            } else {
+                None
+            };
+            let type_partials = if cli.elevenlabs_type_partials {
+                Some(true)
+            } else if cli.no_elevenlabs_type_partials {
+                Some(false)
+            } else {
+                None
+            };
+            elevenlabs.apply_legacy_mode_overrides(streaming, type_partials);
+        }
+        if let Some(value) = cli.elevenlabs_vad_silence_threshold_secs {
+            elevenlabs
+                .set_vad_silence_threshold_secs(value)
+                .expect("validated ElevenLabs VAD silence threshold");
+        }
     }
 
     // Audio overrides
@@ -363,10 +381,12 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
-    const ELEVENLABS_ENV_VARS: [&str; 5] = [
+    const ELEVENLABS_ENV_VARS: [&str; 7] = [
         "ELEVENLABS_API_KEY",
         "VOXTYPE_ELEVENLABS_REGION",
         "VOXTYPE_ELEVENLABS_LANGUAGE",
+        "VOXTYPE_ELEVENLABS_MODE",
+        "VOXTYPE_ELEVENLABS_VAD_SILENCE_THRESHOLD_SECS",
         "VOXTYPE_ELEVENLABS_STREAMING",
         "VOXTYPE_ELEVENLABS_TYPE_PARTIALS",
     ];
@@ -417,8 +437,8 @@ mod tests {
             ("ELEVENLABS_API_KEY", Some("env-secret")),
             ("VOXTYPE_ELEVENLABS_REGION", Some("eu")),
             ("VOXTYPE_ELEVENLABS_LANGUAGE", Some("  en  ")),
-            ("VOXTYPE_ELEVENLABS_STREAMING", Some("false")),
-            ("VOXTYPE_ELEVENLABS_TYPE_PARTIALS", Some("true")),
+            ("VOXTYPE_ELEVENLABS_MODE", Some("partials")),
+            ("VOXTYPE_ELEVENLABS_VAD_SILENCE_THRESHOLD_SECS", Some("0.8")),
         ]);
 
         let config = load_without_config_file();
@@ -428,21 +448,21 @@ mod tests {
                 elevenlabs.api_key.as_deref(),
                 elevenlabs.region,
                 elevenlabs.language_code.as_deref(),
-                elevenlabs.streaming,
-                elevenlabs.type_partials,
+                elevenlabs.mode,
+                elevenlabs.vad_silence_threshold_secs,
             ),
             (
                 Some("env-secret"),
                 config::ElevenLabsRegion::Eu,
                 Some("en"),
-                false,
-                true,
+                config::ElevenLabsMode::Partials,
+                0.8,
             )
         );
     }
 
     #[test]
-    fn elevenlabs_cli_flag_materializes_absent_section() {
+    fn elevenlabs_legacy_cli_flags_materialize_absent_section() {
         let _lock = ENV_MUTEX.lock().unwrap();
         let _env = EnvRestore::set(&[]);
         let mut config = load_without_config_file();
@@ -460,12 +480,8 @@ mod tests {
 
         let elevenlabs = config.elevenlabs.expect("CLI creates section");
         assert_eq!(
-            (
-                elevenlabs.region,
-                elevenlabs.streaming,
-                elevenlabs.type_partials,
-            ),
-            (config::ElevenLabsRegion::Us, false, true)
+            (elevenlabs.region, elevenlabs.mode),
+            (config::ElevenLabsRegion::Us, config::ElevenLabsMode::Batch,)
         );
     }
 
@@ -476,8 +492,8 @@ mod tests {
             ("ELEVENLABS_API_KEY", Some("env-secret")),
             ("VOXTYPE_ELEVENLABS_REGION", Some("eu")),
             ("VOXTYPE_ELEVENLABS_LANGUAGE", Some("fr")),
-            ("VOXTYPE_ELEVENLABS_STREAMING", Some("false")),
-            ("VOXTYPE_ELEVENLABS_TYPE_PARTIALS", Some("true")),
+            ("VOXTYPE_ELEVENLABS_MODE", Some("batch")),
+            ("VOXTYPE_ELEVENLABS_VAD_SILENCE_THRESHOLD_SECS", Some("1.2")),
         ]);
 
         let mut config = load_without_config_file();
@@ -491,8 +507,10 @@ mod tests {
             "singapore",
             "--elevenlabs-language",
             "  de  ",
-            "--elevenlabs-streaming",
-            "--no-elevenlabs-type-partials",
+            "--elevenlabs-mode",
+            "realtime",
+            "--elevenlabs-vad-silence-threshold-secs",
+            "0.6",
         ])
         .unwrap();
 
@@ -506,17 +524,45 @@ mod tests {
                 elevenlabs.api_key.as_deref(),
                 elevenlabs.region,
                 elevenlabs.language_code.as_deref(),
-                elevenlabs.streaming,
-                elevenlabs.type_partials,
+                elevenlabs.mode,
+                elevenlabs.vad_silence_threshold_secs,
             ),
             (
                 config::TranscriptionEngine::ElevenLabs,
                 Some("cli-secret"),
                 config::ElevenLabsRegion::Singapore,
                 Some("de"),
-                true,
-                false,
+                config::ElevenLabsMode::Realtime,
+                0.6,
             )
         );
+    }
+
+    #[test]
+    fn elevenlabs_legacy_environment_booleans_remain_supported() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _env = EnvRestore::set(&[
+            ("VOXTYPE_ELEVENLABS_STREAMING", Some("true")),
+            ("VOXTYPE_ELEVENLABS_TYPE_PARTIALS", Some("true")),
+        ]);
+
+        let config = load_without_config_file();
+        assert_eq!(
+            config.elevenlabs.unwrap().mode,
+            config::ElevenLabsMode::Partials
+        );
+    }
+
+    #[test]
+    fn elevenlabs_cli_rejects_invalid_modes_and_thresholds() {
+        assert!(Cli::try_parse_from(["voxtype", "--elevenlabs-mode", "continuous",]).is_err());
+        for invalid in ["0", "-0.1", "NaN", "inf"] {
+            assert!(Cli::try_parse_from([
+                "voxtype",
+                "--elevenlabs-vad-silence-threshold-secs",
+                invalid,
+            ])
+            .is_err());
+        }
     }
 }

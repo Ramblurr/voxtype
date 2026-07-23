@@ -328,7 +328,7 @@ pub(crate) fn validate_elevenlabs_realtime_output(
     if let Some(setting) = incompatible_setting {
         return Err(TranscribeError::ConfigError(format!(
             "ElevenLabs realtime transcription does not support {setting}; \
-             set [elevenlabs] streaming = false to use batch transcription"
+             set [elevenlabs] mode = \"batch\" to use batch transcription"
         )));
     }
 
@@ -410,16 +410,16 @@ mod tests {
     #[cfg(feature = "elevenlabs")]
     mod elevenlabs {
         use super::*;
-        use crate::config::{ElevenLabsConfig, OutputMode, PostProcessConfig};
+        use crate::config::{ElevenLabsConfig, ElevenLabsMode, OutputMode, PostProcessConfig};
 
         const API_KEY: &str = "test-elevenlabs-key";
 
-        fn config(streaming: bool) -> Config {
+        fn config(mode: ElevenLabsMode) -> Config {
             Config {
                 engine: TranscriptionEngine::ElevenLabs,
                 elevenlabs: Some(ElevenLabsConfig {
                     api_key: Some(API_KEY.to_string()),
-                    streaming,
+                    mode,
                     ..ElevenLabsConfig::default()
                 }),
                 ..Config::default()
@@ -445,7 +445,7 @@ mod tests {
         #[test]
         fn factory_rejects_api_keys_that_are_invalid_http_headers() {
             let invalid_key = "secret\nheader";
-            let mut config = config(true);
+            let mut config = config(ElevenLabsMode::Realtime);
             config.elevenlabs.as_mut().unwrap().api_key = Some(invalid_key.to_string());
 
             let error = factory_error(&config).to_string();
@@ -455,13 +455,32 @@ mod tests {
         }
 
         #[test]
-        fn factory_exposes_realtime_only_when_streaming_is_enabled() {
-            let realtime =
-                create_transcriber(&config(true)).expect("realtime factory construction");
-            let batch = create_transcriber(&config(false)).expect("batch factory construction");
+        fn factory_exposes_streaming_for_realtime_and_partials_modes() {
+            let realtime = create_transcriber(&config(ElevenLabsMode::Realtime))
+                .expect("realtime factory construction");
+            let partials = create_transcriber(&config(ElevenLabsMode::Partials))
+                .expect("partials factory construction");
+            let batch = create_transcriber(&config(ElevenLabsMode::Batch))
+                .expect("batch factory construction");
 
             assert!(realtime.as_streaming().is_some());
+            assert!(partials.as_streaming().is_some());
             assert!(batch.as_streaming().is_none());
+        }
+
+        #[test]
+        fn factory_rejects_invalid_vad_silence_threshold() {
+            let mut config = config(ElevenLabsMode::Realtime);
+            config
+                .elevenlabs
+                .as_mut()
+                .unwrap()
+                .vad_silence_threshold_secs = f32::NAN;
+
+            let error = factory_error(&config).to_string();
+
+            assert!(error.contains("vad_silence_threshold_secs"));
+            assert!(error.contains("positive finite number"));
         }
 
         #[test]
@@ -517,7 +536,7 @@ mod tests {
                     "error for {setting} did not name the unsafe setting: {error}"
                 );
                 assert!(
-                    error.contains("streaming = false"),
+                    error.contains("mode = \"batch\""),
                     "error for {setting} omitted the batch-mode remedy: {error}"
                 );
             }
@@ -527,12 +546,12 @@ mod tests {
                     .expect_err("profile post-processing must be rejected")
                     .to_string();
             assert!(error.contains("profile.post_process_command"));
-            assert!(error.contains("streaming = false"));
+            assert!(error.contains("mode = \"batch\""));
         }
 
         #[test]
         fn factory_leaves_realtime_output_validation_to_daemon_batch_context() {
-            let mut config = config(true);
+            let mut config = config(ElevenLabsMode::Realtime);
             config.output.mode = OutputMode::Clipboard;
             config.output.auto_submit = true;
             config.output.post_process = Some(PostProcessConfig {
@@ -550,7 +569,7 @@ mod tests {
 
         #[test]
         fn batch_factory_allows_settings_rejected_for_realtime() {
-            let mut config = config(false);
+            let mut config = config(ElevenLabsMode::Batch);
             config.output.mode = OutputMode::Clipboard;
             config.output.auto_submit = true;
             config.output.append_text = Some(" ".to_string());

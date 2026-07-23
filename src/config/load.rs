@@ -1,7 +1,7 @@
 use super::parse::parse_config_with_defaults;
 use super::{
-    Config, ElevenLabsConfig, ElevenLabsRegion, LanguageConfig, OutputMode, SonioxConfig,
-    TranscriptionEngine,
+    Config, ElevenLabsConfig, ElevenLabsMode, ElevenLabsRegion, LanguageConfig, OutputMode,
+    SonioxConfig, TranscriptionEngine,
 };
 use crate::error::VoxtypeError;
 use std::path::{Path, PathBuf};
@@ -190,10 +190,12 @@ pub fn load_config(path: Option<&Path>) -> Result<Config, VoxtypeError> {
 
     // ElevenLabs. Any provider-specific environment value materializes the
     // optional section so environment-only source-build configurations work.
-    const ELEVENLABS_ENV_VARS: [&str; 5] = [
+    const ELEVENLABS_ENV_VARS: [&str; 7] = [
         "ELEVENLABS_API_KEY",
         "VOXTYPE_ELEVENLABS_REGION",
         "VOXTYPE_ELEVENLABS_LANGUAGE",
+        "VOXTYPE_ELEVENLABS_MODE",
+        "VOXTYPE_ELEVENLABS_VAD_SILENCE_THRESHOLD_SECS",
         "VOXTYPE_ELEVENLABS_STREAMING",
         "VOXTYPE_ELEVENLABS_TYPE_PARTIALS",
     ];
@@ -216,11 +218,32 @@ pub fn load_config(path: Option<&Path>) -> Result<Config, VoxtypeError> {
         if let Ok(language) = std::env::var("VOXTYPE_ELEVENLABS_LANGUAGE") {
             elevenlabs.set_language_code(&language);
         }
-        if let Ok(value) = std::env::var("VOXTYPE_ELEVENLABS_STREAMING") {
-            elevenlabs.streaming = parse_bool_env(&value);
+        if let Ok(mode) = std::env::var("VOXTYPE_ELEVENLABS_MODE") {
+            match mode.parse::<ElevenLabsMode>() {
+                Ok(mode) => elevenlabs.mode = mode,
+                Err(_) => tracing::warn!("Unknown VOXTYPE_ELEVENLABS_MODE value: {}", mode),
+            }
+        } else {
+            let streaming = std::env::var("VOXTYPE_ELEVENLABS_STREAMING")
+                .ok()
+                .map(|value| parse_bool_env(&value));
+            let type_partials = std::env::var("VOXTYPE_ELEVENLABS_TYPE_PARTIALS")
+                .ok()
+                .map(|value| parse_bool_env(&value));
+            elevenlabs.apply_legacy_mode_overrides(streaming, type_partials);
         }
-        if let Ok(value) = std::env::var("VOXTYPE_ELEVENLABS_TYPE_PARTIALS") {
-            elevenlabs.type_partials = parse_bool_env(&value);
+        if let Ok(value) = std::env::var("VOXTYPE_ELEVENLABS_VAD_SILENCE_THRESHOLD_SECS") {
+            match value.parse::<f32>() {
+                Ok(value) => {
+                    if let Err(error) = elevenlabs.set_vad_silence_threshold_secs(value) {
+                        tracing::warn!("{error}");
+                    }
+                }
+                Err(_) => tracing::warn!(
+                    "Invalid VOXTYPE_ELEVENLABS_VAD_SILENCE_THRESHOLD_SECS value: {}",
+                    value
+                ),
+            }
         }
     }
     if let Ok(val) = std::env::var("VOXTYPE_RESTORE_CLIPBOARD") {

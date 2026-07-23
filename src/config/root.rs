@@ -156,7 +156,7 @@ impl Config {
             TranscriptionEngine::ElevenLabs => self
                 .elevenlabs
                 .as_ref()
-                .map(|e| e.streaming)
+                .map(ElevenLabsConfig::streaming_enabled)
                 .unwrap_or(false),
             _ => false,
         }
@@ -419,7 +419,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::super::hotkey::default_hotkey_key;
-    use super::super::{ActivationMode, OutputMode};
+    use super::super::{ActivationMode, ElevenLabsMode, OutputMode};
     use super::*;
 
     #[test]
@@ -522,7 +522,7 @@ mod tests {
     }
 
     #[test]
-    fn elevenlabs_streaming_active_follows_explicit_config() {
+    fn elevenlabs_streaming_active_follows_mode() {
         let mut config = Config {
             engine: TranscriptionEngine::ElevenLabs,
             ..Config::default()
@@ -532,7 +532,10 @@ mod tests {
         config.elevenlabs = Some(ElevenLabsConfig::default());
         assert!(config.streaming_active());
 
-        config.elevenlabs.as_mut().unwrap().streaming = false;
+        config.elevenlabs.as_mut().unwrap().mode = ElevenLabsMode::Partials;
+        assert!(config.streaming_active());
+
+        config.elevenlabs.as_mut().unwrap().mode = ElevenLabsMode::Batch;
         assert!(!config.streaming_active());
     }
 
@@ -554,6 +557,5 @@ mod tests {
             ..Config::default()
         };
         assert_eq!(config.model_name(), "elevenlabs");
-    }
     }
 }

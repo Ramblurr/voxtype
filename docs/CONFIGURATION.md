@@ -46,6 +46,8 @@ Selects which speech-to-text engine to use for transcription.
 - `dolphin` - Dictation-optimized CTC via ONNX Runtime (Chinese + English)
 - `omnilingual` - FunASR Omnilingual CTC via ONNX Runtime (50+ languages)
 - `cohere` - Cohere Transcribe encoder-decoder via ONNX Runtime (#1 Open ASR Leaderboard, 14 languages, ~3 GB model)
+- `soniox` - Soniox cloud transcription (requires the `soniox` feature)
+- `elevenlabs` - ElevenLabs Scribe cloud transcription (requires the `elevenlabs` feature)
 
 **Example:**
 ```toml
@@ -76,8 +78,9 @@ config changes; restart it with `systemctl --user restart voxtype` for the
 new engine to take effect.
 
 **Notes:**
-- All engines except Whisper require an ONNX-enabled binary (`voxtype-*-onnx-*`)
-- Each ONNX engine reads its own `[<engine>]` section (e.g. `[parakeet]`, `[cohere]`)
+- Local engines other than Whisper require an ONNX-enabled binary (`voxtype-*-onnx-*`).
+- Cloud engines require their matching source-build feature and API key.
+- Each engine reads its own `[<engine>]` section (for example, `[parakeet]` or `[elevenlabs]`).
 - See [PARAKEET.md](PARAKEET.md) for detailed Parakeet setup instructions
 - See [MOONSHINE.md](MOONSHINE.md) for detailed Moonshine setup instructions
 - Cohere Transcribe is the largest model voxtype ships (~3 GB int8); use `voxtype setup model` to download it
@@ -1428,6 +1431,92 @@ cargo build --release --features cohere-tensorrt  # NVIDIA + TensorRT EP
 ```
 
 The prebuilt `voxtype-*-onnx-*` release binaries already include `cohere`, so users installing via AUR/.deb/.rpm don't need to rebuild.
+
+---
+
+## [elevenlabs]
+
+Configuration for the ElevenLabs Scribe cloud transcription engine. This section applies when `engine = "elevenlabs"`. Source builds require the `elevenlabs` Cargo feature.
+
+Audio leaves your machine and goes to ElevenLabs. Use a local engine when your data must remain on-device.
+
+### api_key
+
+**Type:** String (optional)
+**Default:** unset
+
+Set the API key with `ELEVENLABS_API_KEY` instead of storing it in the config file.
+
+### region
+
+**Type:** String
+**Default:** `"global"`
+
+Available regions: `global`, `us`, `eu`, `india`, and `singapore`.
+
+### language_code
+
+**Type:** String (optional)
+**Default:** unset
+
+An ISO 639-1 or ISO 639-3 language hint such as `"en"`.
+
+### mode
+
+**Type:** String
+**Default:** `"realtime"`
+
+Select one of three dictation modes:
+
+- `batch`: record first, then upload the complete recording.
+- `realtime`: stream audio and type only committed segments.
+- `partials`: stream audio and type provisional text while you speak.
+
+Older `streaming` and `type_partials` fields remain accepted. When `mode` appears with either legacy field, `mode` wins.
+
+### vad_silence_threshold_secs
+
+**Type:** Float
+**Default:** `1.5`
+
+Seconds of silence before ElevenLabs commits the current segment in `realtime` or `partials` mode. Lower values type committed text sooner but may split speech at short pauses. The value must be positive and finite.
+
+```toml
+[elevenlabs]
+mode = "partials"
+vad_silence_threshold_secs = 0.8
+```
+
+### Configuration Summary
+
+| Option | CLI Flag | Environment Variable | Default | Description |
+|--------|----------|----------------------|---------|-------------|
+| `api_key` | `--elevenlabs-api-key` | `ELEVENLABS_API_KEY` | none | ElevenLabs API key |
+| `region` | `--elevenlabs-region` | `VOXTYPE_ELEVENLABS_REGION` | `"global"` | API region |
+| `language_code` | `--elevenlabs-language` | `VOXTYPE_ELEVENLABS_LANGUAGE` | none | Language hint |
+| `mode` | `--elevenlabs-mode` | `VOXTYPE_ELEVENLABS_MODE` | `"realtime"` | `batch`, `realtime`, or `partials` |
+| `vad_silence_threshold_secs` | `--elevenlabs-vad-silence-threshold-secs` | `VOXTYPE_ELEVENLABS_VAD_SILENCE_THRESHOLD_SECS` | `1.5` | Silence before a VAD commit |
+
+### Complete Example
+
+```toml
+engine = "elevenlabs"
+
+[hotkey]
+mode = "toggle"
+
+[elevenlabs]
+language_code = "en"
+mode = "partials"
+vad_silence_threshold_secs = 0.8
+# Set the API key with ELEVENLABS_API_KEY
+```
+
+Build from source with:
+
+```bash
+cargo build --features elevenlabs
+```
 
 ---
 

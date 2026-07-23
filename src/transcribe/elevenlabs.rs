@@ -41,7 +41,6 @@ const BATCH_FILE_NAME: &str = "voxtype.pcm";
 const BATCH_FILE_MIME: &str = "application/octet-stream";
 const SAMPLE_RATE: u32 = 16_000;
 const COMMIT_STRATEGY: &str = "vad";
-const VAD_SILENCE_THRESHOLD_SECS: &str = "1.5";
 const VAD_THRESHOLD: &str = "0.4";
 const MIN_SPEECH_DURATION_MS: &str = "100";
 const MIN_SILENCE_DURATION_MS: &str = "100";
@@ -86,7 +85,10 @@ fn realtime_url(config: &ElevenLabsConfig) -> Result<reqwest::Url, TranscribeErr
             .append_pair("model_id", REALTIME_MODEL)
             .append_pair("audio_format", REALTIME_AUDIO_FORMAT)
             .append_pair("commit_strategy", COMMIT_STRATEGY)
-            .append_pair("vad_silence_threshold_secs", VAD_SILENCE_THRESHOLD_SECS)
+            .append_pair(
+                "vad_silence_threshold_secs",
+                &config.vad_silence_threshold_secs.to_string(),
+            )
             .append_pair("vad_threshold", VAD_THRESHOLD)
             .append_pair("min_speech_duration_ms", MIN_SPEECH_DURATION_MS)
             .append_pair("min_silence_duration_ms", MIN_SILENCE_DURATION_MS)
@@ -133,6 +135,7 @@ pub struct ElevenLabsTranscriber {
 
 impl ElevenLabsTranscriber {
     pub fn new(config: &ElevenLabsConfig) -> Result<Self, TranscribeError> {
+        config.validate().map_err(TranscribeError::ConfigError)?;
         let api_key = config.api_key.clone().ok_or_else(|| {
             TranscribeError::ConfigError(
                 "ElevenLabs API key required: set [elevenlabs] api_key or ELEVENLABS_API_KEY"
@@ -219,7 +222,7 @@ impl Transcriber for ElevenLabsTranscriber {
     }
 
     fn as_streaming(&self) -> Option<&dyn StreamingTranscriber> {
-        self.config.streaming.then_some(self as _)
+        self.config.streaming_enabled().then_some(self as _)
     }
 }
 
@@ -230,7 +233,7 @@ impl StreamingTranscriber for ElevenLabsTranscriber {
     ) -> Result<StreamHandle, TranscribeError> {
         let request = realtime_request(&self.config, &self.api_key)?;
         let api_key = self.api_key.clone();
-        let type_partials = self.config.type_partials;
+        let type_partials = self.config.type_partials_enabled();
         let (events_tx, events_rx) = mpsc::channel(STREAM_EVENT_CHANNEL_CAPACITY);
         let (cancel_tx, cancel_rx) = oneshot::channel();
 
@@ -1824,6 +1827,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::config::ElevenLabsMode;
 
     const API_KEY: &str = "elevenlabs-secret-key";
 
@@ -2024,6 +2028,7 @@ mod tests {
             let config = ElevenLabsConfig {
                 region,
                 language_code: Some("en".to_string()),
+                vad_silence_threshold_secs: 0.65,
                 ..ElevenLabsConfig::default()
             };
             let request = realtime_request(&config, API_KEY).unwrap();
@@ -2038,7 +2043,7 @@ mod tests {
                 ("min_speech_duration_ms".to_string(), "100".to_string()),
                 ("model_id".to_string(), "scribe_v2_realtime".to_string()),
                 ("no_verbatim".to_string(), "false".to_string()),
-                ("vad_silence_threshold_secs".to_string(), "1.5".to_string()),
+                ("vad_silence_threshold_secs".to_string(), "0.65".to_string()),
                 ("vad_threshold".to_string(), "0.4".to_string()),
             ]);
 
@@ -2409,8 +2414,8 @@ mod tests {
             api_key: Some(API_KEY.to_string()),
             region,
             language_code: Some("en".to_string()),
-            streaming: false,
-            type_partials: false,
+            mode: ElevenLabsMode::Batch,
+            ..ElevenLabsConfig::default()
         }
     }
 

@@ -14,7 +14,7 @@ mod soniox;
 
 pub use cohere::CohereConfig;
 pub use dolphin::DolphinConfig;
-pub use elevenlabs::{ElevenLabsConfig, ElevenLabsRegion};
+pub use elevenlabs::{ElevenLabsConfig, ElevenLabsMode, ElevenLabsRegion};
 pub use moonshine::MoonshineConfig;
 pub use omnilingual::OmnilingualConfig;
 pub use paraformer::ParaformerConfig;
