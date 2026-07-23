@@ -176,6 +176,9 @@ pub(crate) fn apply_cli_overrides(config: &mut config::Config, cli: &Cli) -> Opt
         || cli.elevenlabs_region.is_some()
         || cli.elevenlabs_language.is_some()
         || cli.elevenlabs_mode.is_some()
+        || cli.elevenlabs_commit_strategy.is_some()
+        || cli.elevenlabs_no_verbatim
+        || cli.elevenlabs_verbatim
         || cli.elevenlabs_vad_silence_threshold_secs.is_some()
     {
         let elevenlabs = config
@@ -198,6 +201,16 @@ pub(crate) fn apply_cli_overrides(config: &mut config::Config, cli: &Cli) -> Opt
                 .parse::<config::ElevenLabsMode>()
                 .expect("validated ElevenLabs mode");
         }
+        if let Some(ref strategy) = cli.elevenlabs_commit_strategy {
+            elevenlabs.commit_strategy = strategy
+                .parse::<config::ElevenLabsCommitStrategy>()
+                .expect("validated ElevenLabs commit strategy");
+        }
+        apply_bool_override(
+            &mut elevenlabs.no_verbatim,
+            cli.elevenlabs_no_verbatim,
+            cli.elevenlabs_verbatim,
+        );
         if let Some(value) = cli.elevenlabs_vad_silence_threshold_secs {
             elevenlabs
                 .set_vad_silence_threshold_secs(value)
@@ -361,11 +374,13 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
-    const ELEVENLABS_ENV_VARS: [&str; 5] = [
+    const ELEVENLABS_ENV_VARS: [&str; 7] = [
         "ELEVENLABS_API_KEY",
         "VOXTYPE_ELEVENLABS_REGION",
         "VOXTYPE_ELEVENLABS_LANGUAGE",
         "VOXTYPE_ELEVENLABS_MODE",
+        "VOXTYPE_ELEVENLABS_COMMIT_STRATEGY",
+        "VOXTYPE_ELEVENLABS_NO_VERBATIM",
         "VOXTYPE_ELEVENLABS_VAD_SILENCE_THRESHOLD_SECS",
     ];
 
@@ -410,12 +425,16 @@ mod tests {
 
     #[test]
     fn elevenlabs_environment_materializes_and_layers_all_values() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let _env = EnvRestore::set(&[
             ("ELEVENLABS_API_KEY", Some("env-secret")),
             ("VOXTYPE_ELEVENLABS_REGION", Some("eu")),
             ("VOXTYPE_ELEVENLABS_LANGUAGE", Some("  en  ")),
             ("VOXTYPE_ELEVENLABS_MODE", Some("partials")),
+            ("VOXTYPE_ELEVENLABS_COMMIT_STRATEGY", Some("manual")),
+            ("VOXTYPE_ELEVENLABS_NO_VERBATIM", Some("true")),
             ("VOXTYPE_ELEVENLABS_VAD_SILENCE_THRESHOLD_SECS", Some("0.8")),
         ]);
 
@@ -427,6 +446,8 @@ mod tests {
                 elevenlabs.region,
                 elevenlabs.language_code.as_deref(),
                 elevenlabs.mode,
+                elevenlabs.commit_strategy,
+                elevenlabs.no_verbatim,
                 elevenlabs.vad_silence_threshold_secs,
             ),
             (
@@ -434,6 +455,8 @@ mod tests {
                 config::ElevenLabsRegion::Eu,
                 Some("en"),
                 config::ElevenLabsMode::Partials,
+                config::ElevenLabsCommitStrategy::Manual,
+                true,
                 0.8,
             )
         );
@@ -441,7 +464,9 @@ mod tests {
 
     #[test]
     fn elevenlabs_mode_flag_materializes_absent_section() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let _env = EnvRestore::set(&[]);
         let mut config = load_without_config_file();
         assert!(config.elevenlabs.is_none());
@@ -464,13 +489,42 @@ mod tests {
     }
 
     #[test]
+    fn elevenlabs_cleanup_flags_materialize_absent_section() {
+        let _lock = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let _env = EnvRestore::set(&[]);
+        let mut config = load_without_config_file();
+        assert!(config.elevenlabs.is_none());
+
+        let cli = Cli::try_parse_from([
+            "voxtype",
+            "--elevenlabs-commit-strategy",
+            "manual",
+            "--elevenlabs-no-verbatim",
+        ])
+        .unwrap();
+        apply_cli_overrides(&mut config, &cli);
+
+        let elevenlabs = config.elevenlabs.expect("CLI creates section");
+        assert_eq!(
+            (elevenlabs.commit_strategy, elevenlabs.no_verbatim),
+            (config::ElevenLabsCommitStrategy::Manual, true)
+        );
+    }
+
+    #[test]
     fn elevenlabs_cli_overrides_environment_values() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let _env = EnvRestore::set(&[
             ("ELEVENLABS_API_KEY", Some("env-secret")),
             ("VOXTYPE_ELEVENLABS_REGION", Some("eu")),
             ("VOXTYPE_ELEVENLABS_LANGUAGE", Some("fr")),
             ("VOXTYPE_ELEVENLABS_MODE", Some("batch")),
+            ("VOXTYPE_ELEVENLABS_COMMIT_STRATEGY", Some("vad")),
+            ("VOXTYPE_ELEVENLABS_NO_VERBATIM", Some("false")),
             ("VOXTYPE_ELEVENLABS_VAD_SILENCE_THRESHOLD_SECS", Some("1.2")),
         ]);
 
@@ -487,6 +541,9 @@ mod tests {
             "  de  ",
             "--elevenlabs-mode",
             "realtime",
+            "--elevenlabs-commit-strategy",
+            "manual",
+            "--elevenlabs-no-verbatim",
             "--elevenlabs-vad-silence-threshold-secs",
             "0.6",
         ])
@@ -503,6 +560,8 @@ mod tests {
                 elevenlabs.region,
                 elevenlabs.language_code.as_deref(),
                 elevenlabs.mode,
+                elevenlabs.commit_strategy,
+                elevenlabs.no_verbatim,
                 elevenlabs.vad_silence_threshold_secs,
             ),
             (
@@ -511,13 +570,42 @@ mod tests {
                 config::ElevenLabsRegion::Singapore,
                 Some("de"),
                 config::ElevenLabsMode::Realtime,
+                config::ElevenLabsCommitStrategy::Manual,
+                true,
                 0.6,
             )
         );
     }
 
     #[test]
-    fn elevenlabs_cli_rejects_invalid_values() {
+    fn elevenlabs_verbatim_flag_overrides_true_configuration() {
+        let _lock = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let _env = EnvRestore::set(&[]);
+        let mut config = load_without_config_file();
+        config.elevenlabs = Some(config::ElevenLabsConfig {
+            no_verbatim: true,
+            ..config::ElevenLabsConfig::default()
+        });
+        let cli = Cli::try_parse_from(["voxtype", "--elevenlabs-verbatim"]).unwrap();
+
+        apply_cli_overrides(&mut config, &cli);
+
+        assert!(!config.elevenlabs.unwrap().no_verbatim);
+    }
+
+    #[test]
+    fn elevenlabs_cli_rejects_conflicting_cleanup_flags_and_invalid_values() {
+        assert!(Cli::try_parse_from([
+            "voxtype",
+            "--elevenlabs-no-verbatim",
+            "--elevenlabs-verbatim",
+        ])
+        .is_err());
+        assert!(
+            Cli::try_parse_from(["voxtype", "--elevenlabs-commit-strategy", "automatic",]).is_err()
+        );
         assert!(Cli::try_parse_from(["voxtype", "--elevenlabs-mode", "continuous",]).is_err());
         for invalid in ["0", "-0.1", "NaN", "inf"] {
             assert!(Cli::try_parse_from([
@@ -527,5 +615,21 @@ mod tests {
             ])
             .is_err());
         }
+    }
+
+    #[test]
+    fn invalid_environment_commit_strategy_retains_default_and_materializes_section() {
+        let _lock = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let _env = EnvRestore::set(&[("VOXTYPE_ELEVENLABS_COMMIT_STRATEGY", Some("automatic"))]);
+
+        let elevenlabs = load_without_config_file()
+            .elevenlabs
+            .expect("provider environment materializes section");
+        assert_eq!(
+            elevenlabs.commit_strategy,
+            config::ElevenLabsCommitStrategy::Vad
+        );
     }
 }

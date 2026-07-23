@@ -238,6 +238,34 @@ pub struct Cli {
     )]
     pub elevenlabs_mode: Option<String>,
 
+    /// When ElevenLabs commits realtime segments: vad or manual
+    #[arg(
+        long,
+        value_name = "STRATEGY",
+        value_parser = ["vad", "manual"],
+        help_heading = "ElevenLabs",
+        hide_short_help = true
+    )]
+    pub elevenlabs_commit_strategy: Option<String>,
+
+    /// Remove provider-detected filler words, false starts, and disfluencies
+    #[arg(
+        long,
+        help_heading = "ElevenLabs",
+        hide_short_help = true,
+        conflicts_with = "elevenlabs_verbatim"
+    )]
+    pub elevenlabs_no_verbatim: bool,
+
+    /// Preserve filler words, false starts, and disfluencies
+    #[arg(
+        long,
+        help_heading = "ElevenLabs",
+        hide_short_help = true,
+        conflicts_with = "elevenlabs_no_verbatim"
+    )]
+    pub elevenlabs_verbatim: bool,
+
     /// Seconds of silence before ElevenLabs commits a realtime segment
     #[arg(
         long,

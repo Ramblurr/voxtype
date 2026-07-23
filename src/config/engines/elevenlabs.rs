@@ -58,6 +58,29 @@ pub enum ElevenLabsMode {
     Partials,
 }
 
+/// Strategy for committing ElevenLabs realtime transcript segments.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    Deserialize,
+    Serialize,
+    PartialEq,
+    Eq,
+    strum::Display,
+    strum::EnumString,
+)]
+#[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
+pub enum ElevenLabsCommitStrategy {
+    /// Let ElevenLabs commit after configured silence.
+    #[default]
+    Vad,
+    /// Keep the segment open until VoxType explicitly commits it.
+    Manual,
+}
+
 /// ElevenLabs Scribe cloud transcription configuration.
 /// Requires: cargo build --features elevenlabs
 #[derive(Clone, Deserialize, Serialize)]
@@ -75,6 +98,12 @@ pub struct ElevenLabsConfig {
 
     /// Dictation behavior. Default: `realtime`.
     pub mode: ElevenLabsMode,
+
+    /// Realtime segment commit strategy. Default: `vad`.
+    pub commit_strategy: ElevenLabsCommitStrategy,
+
+    /// Remove provider-detected fillers and disfluencies. Default: false.
+    pub no_verbatim: bool,
 
     /// Silence required before VAD commits a realtime segment. Default: 1.5 seconds.
     #[serde(deserialize_with = "deserialize_vad_silence_threshold_secs")]
@@ -117,6 +146,8 @@ impl Default for ElevenLabsConfig {
             region: ElevenLabsRegion::Global,
             language_code: None,
             mode: ElevenLabsMode::Realtime,
+            commit_strategy: ElevenLabsCommitStrategy::Vad,
+            no_verbatim: false,
             vad_silence_threshold_secs: default_vad_silence_threshold_secs(),
         }
     }
@@ -130,6 +161,8 @@ impl std::fmt::Debug for ElevenLabsConfig {
             .field("region", &self.region)
             .field("language_code", &self.language_code)
             .field("mode", &self.mode)
+            .field("commit_strategy", &self.commit_strategy)
+            .field("no_verbatim", &self.no_verbatim)
             .field(
                 "vad_silence_threshold_secs",
                 &self.vad_silence_threshold_secs,
@@ -185,6 +218,8 @@ mod tests {
                 config.region,
                 config.language_code,
                 config.mode,
+                config.commit_strategy,
+                config.no_verbatim,
                 config.vad_silence_threshold_secs,
             ),
             (
@@ -192,6 +227,8 @@ mod tests {
                 ElevenLabsRegion::Global,
                 None,
                 ElevenLabsMode::Realtime,
+                ElevenLabsCommitStrategy::Vad,
+                false,
                 1.5,
             )
         );
@@ -203,6 +240,8 @@ mod tests {
                 deserialized.region,
                 deserialized.language_code,
                 deserialized.mode,
+                deserialized.commit_strategy,
+                deserialized.no_verbatim,
                 deserialized.vad_silence_threshold_secs,
             ),
             (
@@ -210,6 +249,8 @@ mod tests {
                 ElevenLabsRegion::Global,
                 None,
                 ElevenLabsMode::Realtime,
+                ElevenLabsCommitStrategy::Vad,
+                false,
                 1.5,
             )
         );
@@ -272,6 +313,20 @@ mod tests {
     }
 
     #[test]
+    fn parses_and_rejects_commit_strategies() {
+        for (value, expected) in [
+            ("vad", ElevenLabsCommitStrategy::Vad),
+            ("manual", ElevenLabsCommitStrategy::Manual),
+        ] {
+            let config: ElevenLabsConfig =
+                toml::from_str(&format!("commit_strategy = \"{value}\"")).unwrap();
+            assert_eq!(config.commit_strategy, expected);
+        }
+
+        assert!(toml::from_str::<ElevenLabsConfig>("commit_strategy = \"automatic\"").is_err());
+    }
+
+    #[test]
     fn rejects_unknown_keys() {
         assert!(toml::from_str::<ElevenLabsConfig>("unexpected = true").is_err());
     }
@@ -291,15 +346,25 @@ mod tests {
     }
 
     #[test]
-    fn serialization_includes_mode_and_vad_threshold() {
-        let config = ElevenLabsConfig {
-            mode: ElevenLabsMode::Partials,
-            vad_silence_threshold_secs: 0.75,
-            ..ElevenLabsConfig::default()
-        };
+    fn serialization_includes_provider_behavior_settings() {
+        let config: ElevenLabsConfig = toml::from_str(
+            r#"
+                mode = "partials"
+                commit_strategy = "manual"
+                no_verbatim = true
+                vad_silence_threshold_secs = 0.75
+            "#,
+        )
+        .unwrap();
 
+        assert_eq!(
+            (config.commit_strategy, config.no_verbatim),
+            (ElevenLabsCommitStrategy::Manual, true)
+        );
         let serialized = toml::to_string(&config).unwrap();
         assert!(serialized.contains("mode = \"partials\""));
+        assert!(serialized.contains("commit_strategy = \"manual\""));
+        assert!(serialized.contains("no_verbatim = true"));
         assert!(serialized.contains("vad_silence_threshold_secs = 0.75"));
     }
 

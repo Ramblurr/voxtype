@@ -76,6 +76,15 @@ pub enum StreamingEvent {
     /// partial without typing it again and clears the segment's partial state.
     Final { text: String, segment_id: SegmentId },
 
+    /// Revise only the provisional tail without committing the segment.
+    /// `backspace` counts Unicode scalar values in the current provisional
+    /// buffer, and `text` is the corrected suffix to append afterward.
+    RevisePartial {
+        backspace: usize,
+        text: String,
+        segment_id: SegmentId,
+    },
+
     /// Replace a corrected tail and commit the segment. `backspace` is the
     /// number of Unicode scalar values to remove from the partial text already
     /// emitted for this segment, and `text` is the corrected final suffix to
@@ -174,5 +183,22 @@ mod tests {
         // Sanity: discriminant difference matters for the daemon's match arms.
         assert!(matches!(p, StreamingEvent::Partial { .. }));
         assert!(matches!(f, StreamingEvent::Final { .. }));
+    }
+
+    #[test]
+    fn streaming_event_partial_revision_is_not_a_final_replacement() {
+        let revision = StreamingEvent::RevisePartial {
+            backspace: 1,
+            text: " because".into(),
+            segment_id: 7,
+        };
+        let replacement = StreamingEvent::Replace {
+            backspace: 1,
+            text: " because".into(),
+            segment_id: 7,
+        };
+
+        assert!(matches!(revision, StreamingEvent::RevisePartial { .. }));
+        assert!(matches!(replacement, StreamingEvent::Replace { .. }));
     }
 }

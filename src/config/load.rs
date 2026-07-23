@@ -1,7 +1,7 @@
 use super::parse::parse_config_with_defaults;
 use super::{
-    Config, ElevenLabsConfig, ElevenLabsMode, ElevenLabsRegion, LanguageConfig, OutputMode,
-    SonioxConfig, TranscriptionEngine,
+    Config, ElevenLabsCommitStrategy, ElevenLabsConfig, ElevenLabsMode, ElevenLabsRegion,
+    LanguageConfig, OutputMode, SonioxConfig, TranscriptionEngine,
 };
 use crate::error::VoxtypeError;
 use std::path::{Path, PathBuf};
@@ -190,11 +190,13 @@ pub fn load_config(path: Option<&Path>) -> Result<Config, VoxtypeError> {
 
     // ElevenLabs. Any provider-specific environment value materializes the
     // optional section so environment-only source-build configurations work.
-    const ELEVENLABS_ENV_VARS: [&str; 5] = [
+    const ELEVENLABS_ENV_VARS: [&str; 7] = [
         "ELEVENLABS_API_KEY",
         "VOXTYPE_ELEVENLABS_REGION",
         "VOXTYPE_ELEVENLABS_LANGUAGE",
         "VOXTYPE_ELEVENLABS_MODE",
+        "VOXTYPE_ELEVENLABS_COMMIT_STRATEGY",
+        "VOXTYPE_ELEVENLABS_NO_VERBATIM",
         "VOXTYPE_ELEVENLABS_VAD_SILENCE_THRESHOLD_SECS",
     ];
     if ELEVENLABS_ENV_VARS
@@ -221,6 +223,18 @@ pub fn load_config(path: Option<&Path>) -> Result<Config, VoxtypeError> {
                 Ok(mode) => elevenlabs.mode = mode,
                 Err(_) => tracing::warn!("Unknown VOXTYPE_ELEVENLABS_MODE value: {}", mode),
             }
+        }
+        if let Ok(strategy) = std::env::var("VOXTYPE_ELEVENLABS_COMMIT_STRATEGY") {
+            match strategy.parse::<ElevenLabsCommitStrategy>() {
+                Ok(strategy) => elevenlabs.commit_strategy = strategy,
+                Err(_) => tracing::warn!(
+                    "Unknown VOXTYPE_ELEVENLABS_COMMIT_STRATEGY value: {}",
+                    strategy
+                ),
+            }
+        }
+        if let Ok(value) = std::env::var("VOXTYPE_ELEVENLABS_NO_VERBATIM") {
+            elevenlabs.no_verbatim = parse_bool_env(&value);
         }
         if let Ok(value) = std::env::var("VOXTYPE_ELEVENLABS_VAD_SILENCE_THRESHOLD_SECS") {
             match value.parse::<f32>() {

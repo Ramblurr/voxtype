@@ -29,7 +29,7 @@ use tokio_tungstenite::{
 
 use super::{SegmentId, StreamHandle, StreamingEvent, StreamingTranscriber, Transcriber};
 use crate::{
-    config::{ElevenLabsConfig, ElevenLabsRegion},
+    config::{ElevenLabsCommitStrategy, ElevenLabsConfig, ElevenLabsRegion},
     error::TranscribeError,
 };
 
@@ -40,7 +40,6 @@ const BATCH_FILE_FORMAT: &str = "pcm_s16le_16";
 const BATCH_FILE_NAME: &str = "voxtype.pcm";
 const BATCH_FILE_MIME: &str = "application/octet-stream";
 const SAMPLE_RATE: u32 = 16_000;
-const COMMIT_STRATEGY: &str = "vad";
 const VAD_THRESHOLD: &str = "0.4";
 const MIN_SPEECH_DURATION_MS: &str = "100";
 const MIN_SILENCE_DURATION_MS: &str = "100";
@@ -84,15 +83,18 @@ fn realtime_url(config: &ElevenLabsConfig) -> Result<reqwest::Url, TranscribeErr
         query
             .append_pair("model_id", REALTIME_MODEL)
             .append_pair("audio_format", REALTIME_AUDIO_FORMAT)
-            .append_pair("commit_strategy", COMMIT_STRATEGY)
-            .append_pair(
-                "vad_silence_threshold_secs",
-                &config.vad_silence_threshold_secs.to_string(),
-            )
-            .append_pair("vad_threshold", VAD_THRESHOLD)
-            .append_pair("min_speech_duration_ms", MIN_SPEECH_DURATION_MS)
-            .append_pair("min_silence_duration_ms", MIN_SILENCE_DURATION_MS)
-            .append_pair("no_verbatim", "false");
+            .append_pair("commit_strategy", &config.commit_strategy.to_string())
+            .append_pair("no_verbatim", &config.no_verbatim.to_string());
+        if config.commit_strategy == ElevenLabsCommitStrategy::Vad {
+            query
+                .append_pair(
+                    "vad_silence_threshold_secs",
+                    &config.vad_silence_threshold_secs.to_string(),
+                )
+                .append_pair("vad_threshold", VAD_THRESHOLD)
+                .append_pair("min_speech_duration_ms", MIN_SPEECH_DURATION_MS)
+                .append_pair("min_silence_duration_ms", MIN_SILENCE_DURATION_MS);
+        }
         if let Some(language_code) = config.language_code.as_deref() {
             query.append_pair("language_code", language_code);
         }
@@ -171,7 +173,11 @@ impl ElevenLabsTranscriber {
         validate_batch_input(samples)?;
 
         let client = self.batch_client()?;
-        let upload = BatchUpload::new(samples, self.config.language_code.clone());
+        let upload = BatchUpload::new(
+            samples,
+            self.config.language_code.clone(),
+            self.config.no_verbatim,
+        );
         let request = build_batch_request(client, &self.config, &self.api_key, upload)?;
         let response = client.execute(request).await.map_err(|error| {
             TranscribeError::NetworkError(format!(
@@ -286,18 +292,20 @@ struct BatchUpload {
     language_code: Option<String>,
     model_id: &'static str,
     file_format: &'static str,
+    no_verbatim: bool,
     tag_audio_events: bool,
     diarize: bool,
     webhook: bool,
 }
 
 impl BatchUpload {
-    fn new(samples: &[f32], language_code: Option<String>) -> Self {
+    fn new(samples: &[f32], language_code: Option<String>, no_verbatim: bool) -> Self {
         Self {
             pcm16le: f32_to_pcm16le(samples),
             language_code,
             model_id: BATCH_MODEL,
             file_format: BATCH_FILE_FORMAT,
+            no_verbatim,
             tag_audio_events: false,
             diarize: false,
             webhook: false,
@@ -324,6 +332,7 @@ impl BatchUpload {
 
         Ok(form
             .text("tag_audio_events", self.tag_audio_events.to_string())
+            .text("no_verbatim", self.no_verbatim.to_string())
             .text("diarize", self.diarize.to_string())
             .text("webhook", self.webhook.to_string()))
     }
@@ -745,20 +754,26 @@ impl TranscriptReconciler {
     }
 
     fn process_partial(&mut self, snapshot: String) -> Vec<StreamingEvent> {
-        if !self.type_partials || !snapshot.starts_with(&self.typed_partial) {
+        if !self.type_partials || snapshot == self.typed_partial {
             return Vec::new();
         }
 
-        let suffix = snapshot[self.typed_partial.len()..].to_string();
-        if suffix.is_empty() {
-            return Vec::new();
-        }
+        let event = if snapshot.starts_with(&self.typed_partial) {
+            StreamingEvent::Partial {
+                text: snapshot[self.typed_partial.len()..].to_string(),
+                segment_id: self.segment_id,
+            }
+        } else {
+            let common_chars = common_prefix_char_count(&self.typed_partial, &snapshot);
+            StreamingEvent::RevisePartial {
+                backspace: self.typed_partial.chars().count() - common_chars,
+                text: snapshot.chars().skip(common_chars).collect(),
+                segment_id: self.segment_id,
+            }
+        };
 
         self.typed_partial = snapshot;
-        vec![StreamingEvent::Partial {
-            text: suffix,
-            segment_id: self.segment_id,
-        }]
+        vec![event]
     }
 
     fn process_commit(&mut self, committed: String) -> StreamingEvent {
@@ -813,6 +828,29 @@ fn process_incoming_text(
         events: reconciler.process(message),
         committed,
     })
+}
+
+fn process_final_drain_text(
+    payload: &str,
+    api_key: &str,
+    reconciler: &mut TranscriptReconciler,
+    lifecycle: &RealtimeLifecycle,
+) -> Result<ProcessedIncoming, TranscribeError> {
+    // A partial is defined as pre-commit state. Some VAD sessions emit a stale
+    // echo after the explicit commit has already produced a qualified final.
+    // Do not start a new cursor segment from that post-final echo.
+    if lifecycle.phase == SessionPhase::DrainingQuiet
+        && matches!(
+            parse_wire_message(payload, api_key)?,
+            WireMessage::Partial { .. }
+        )
+    {
+        return Ok(ProcessedIncoming {
+            events: Vec::new(),
+            committed: false,
+        });
+    }
+    process_incoming_text(payload, api_key, reconciler)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1556,12 +1594,15 @@ where
 
                 match message {
                     Message::Text(payload) => {
-                        let processed =
-                            match process_incoming_text(payload.as_ref(), api_key, &mut reconciler)
-                            {
-                                Ok(processed) => processed,
-                                Err(error) => return fatal_exit(lifecycle, error),
-                            };
+                        let processed = match process_final_drain_text(
+                            payload.as_ref(),
+                            api_key,
+                            &mut reconciler,
+                            lifecycle,
+                        ) {
+                            Ok(processed) => processed,
+                            Err(error) => return fatal_exit(lifecycle, error),
+                        };
                         if processed.committed && lifecycle.note_committed() {
                             quiet_deadline =
                                 Some(tokio::time::Instant::now() + POST_FINAL_QUIET_PERIOD);
@@ -1827,7 +1868,8 @@ mod tests {
     };
 
     use super::*;
-    use crate::config::ElevenLabsMode;
+    use crate::config::{ElevenLabsCommitStrategy, ElevenLabsMode};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const API_KEY: &str = "elevenlabs-secret-key";
 
@@ -1904,6 +1946,7 @@ mod tests {
     #[derive(Debug, PartialEq, Eq)]
     enum EventView {
         Partial(String, SegmentId),
+        RevisePartial(usize, String, SegmentId),
         Final(String, SegmentId),
         Replace(usize, String, SegmentId),
         Error(String),
@@ -1917,6 +1960,11 @@ mod tests {
                 StreamingEvent::Partial { text, segment_id } => {
                     EventView::Partial(text, segment_id)
                 }
+                StreamingEvent::RevisePartial {
+                    backspace,
+                    text,
+                    segment_id,
+                } => EventView::RevisePartial(backspace, text, segment_id),
                 StreamingEvent::Final { text, segment_id } => EventView::Final(text, segment_id),
                 StreamingEvent::Replace {
                     backspace,
@@ -2028,6 +2076,8 @@ mod tests {
             let config = ElevenLabsConfig {
                 region,
                 language_code: Some("en".to_string()),
+                commit_strategy: ElevenLabsCommitStrategy::Vad,
+                no_verbatim: true,
                 vad_silence_threshold_secs: 0.65,
                 ..ElevenLabsConfig::default()
             };
@@ -2042,19 +2092,84 @@ mod tests {
                 ("min_silence_duration_ms".to_string(), "100".to_string()),
                 ("min_speech_duration_ms".to_string(), "100".to_string()),
                 ("model_id".to_string(), "scribe_v2_realtime".to_string()),
-                ("no_verbatim".to_string(), "false".to_string()),
+                ("no_verbatim".to_string(), "true".to_string()),
                 ("vad_silence_threshold_secs".to_string(), "0.65".to_string()),
                 ("vad_threshold".to_string(), "0.4".to_string()),
             ]);
 
-            assert_eq!(url.scheme(), "wss");
-            assert_eq!(url.host_str(), Some(expected_host));
-            assert_eq!(url.path(), "/v1/speech-to-text/realtime");
-            assert_eq!(query, expected_query);
+            assert_eq!(
+                (url.scheme(), url.host_str(), url.path(), query),
+                (
+                    "wss",
+                    Some(expected_host),
+                    "/v1/speech-to-text/realtime",
+                    expected_query
+                )
+            );
             assert!(!uri.contains(API_KEY));
             let header = request.headers().get(&API_KEY_HEADER).unwrap();
             assert_eq!(header, API_KEY);
             assert!(header.is_sensitive());
+        }
+    }
+
+    #[test]
+    fn manual_realtime_request_omits_vad_tuning() {
+        let config = ElevenLabsConfig {
+            commit_strategy: ElevenLabsCommitStrategy::Manual,
+            no_verbatim: false,
+            vad_silence_threshold_secs: 0.65,
+            ..ElevenLabsConfig::default()
+        };
+        let request = realtime_request(&config, API_KEY).unwrap();
+        let uri = request.uri().to_string();
+        let url = reqwest::Url::parse(&uri).unwrap();
+        let query: BTreeMap<_, _> = url.query_pairs().into_owned().collect();
+
+        assert_eq!(
+            query,
+            BTreeMap::from([
+                ("audio_format".to_string(), "pcm_16000".to_string()),
+                ("commit_strategy".to_string(), "manual".to_string()),
+                ("model_id".to_string(), "scribe_v2_realtime".to_string()),
+                ("no_verbatim".to_string(), "false".to_string()),
+            ])
+        );
+        assert!(!uri.contains(API_KEY));
+        assert!(request
+            .headers()
+            .get(&API_KEY_HEADER)
+            .unwrap()
+            .is_sensitive());
+    }
+
+    #[test]
+    fn realtime_request_keeps_commit_strategy_and_cleanup_independent() {
+        for (strategy, expected_strategy) in [
+            (ElevenLabsCommitStrategy::Vad, "vad"),
+            (ElevenLabsCommitStrategy::Manual, "manual"),
+        ] {
+            for no_verbatim in [false, true] {
+                let config = ElevenLabsConfig {
+                    commit_strategy: strategy,
+                    no_verbatim,
+                    ..ElevenLabsConfig::default()
+                };
+                let request = realtime_request(&config, API_KEY).unwrap();
+                let url = reqwest::Url::parse(&request.uri().to_string()).unwrap();
+                let query: BTreeMap<_, _> = url.query_pairs().into_owned().collect();
+
+                assert_eq!(
+                    (
+                        query.get("commit_strategy").map(String::as_str),
+                        query.get("no_verbatim").map(String::as_str),
+                    ),
+                    (
+                        Some(expected_strategy),
+                        Some(if no_verbatim { "true" } else { "false" }),
+                    ),
+                );
+            }
         }
     }
 
@@ -2185,56 +2300,113 @@ mod tests {
     }
 
     #[test]
-    fn reconciles_partial_extensions_repeats_divergence_and_unicode() {
+    fn reconciles_repeated_appended_divergent_retracted_and_unicode_partials() {
         struct Case {
             name: &'static str,
-            snapshots: &'static [&'static str],
-            expected: Vec<EventView>,
+            existing: &'static str,
+            snapshot: &'static str,
+            expected_second: Option<EventView>,
         }
         let cases = [
             Case {
-                name: "extensions",
-                snapshots: &["hel", "hello"],
-                expected: vec![
-                    EventView::Partial("hel".to_string(), 0),
-                    EventView::Partial("lo".to_string(), 0),
-                ],
+                name: "append",
+                existing: "hello",
+                snapshot: "hello world",
+                expected_second: Some(EventView::Partial(" world".to_string(), 0)),
             },
             Case {
-                name: "repeats",
-                snapshots: &["hello", "hello"],
-                expected: vec![EventView::Partial("hello".to_string(), 0)],
+                name: "repeat",
+                existing: "hello",
+                snapshot: "hello",
+                expected_second: None,
             },
             Case {
-                name: "divergence then stable extension",
-                snapshots: &["hello", "hullo", "hello world"],
-                expected: vec![
-                    EventView::Partial("hello".to_string(), 0),
-                    EventView::Partial(" world".to_string(), 0),
-                ],
+                name: "punctuation correction",
+                existing: "This is difficult.",
+                snapshot: "This is difficult because",
+                expected_second: Some(EventView::RevisePartial(1, " because".to_string(), 0)),
             },
             Case {
-                name: "unicode extension",
-                snapshots: &["hé", "héllo"],
-                expected: vec![
-                    EventView::Partial("hé".to_string(), 0),
-                    EventView::Partial("llo".to_string(), 0),
-                ],
+                name: "word correction",
+                existing: "hello wurld",
+                snapshot: "hello world",
+                expected_second: Some(EventView::RevisePartial(4, "orld".to_string(), 0)),
+            },
+            Case {
+                name: "retraction",
+                existing: "hello world",
+                snapshot: "hello",
+                expected_second: Some(EventView::RevisePartial(6, String::new(), 0)),
+            },
+            Case {
+                name: "unicode scalar correction",
+                existing: "naïf",
+                snapshot: "naïve",
+                expected_second: Some(EventView::RevisePartial(1, "ve".to_string(), 0)),
+            },
+            Case {
+                name: "unicode scalar suffix retraction",
+                existing: "你好",
+                snapshot: "你们",
+                expected_second: Some(EventView::RevisePartial(1, "们".to_string(), 0)),
             },
         ];
 
         for case in cases {
             let mut reconciler = TranscriptReconciler::new(true);
-            let messages = case.snapshots.iter().map(|text| WireMessage::Partial {
-                text: (*text).to_string(),
-            });
-            assert_eq!(
-                process_all(&mut reconciler, messages),
-                case.expected,
-                "{}",
-                case.name
+            let events = process_all(
+                &mut reconciler,
+                [
+                    WireMessage::Partial {
+                        text: case.existing.to_string(),
+                    },
+                    WireMessage::Partial {
+                        text: case.snapshot.to_string(),
+                    },
+                ],
             );
+            let mut expected = vec![EventView::Partial(case.existing.to_string(), 0)];
+            expected.extend(case.expected_second);
+            assert_eq!(events, expected, "{}", case.name);
+            assert_eq!(reconciler.typed_partial, case.snapshot, "{}", case.name);
+            assert_eq!(reconciler.segment_id, 0, "{}", case.name);
         }
+    }
+
+    #[test]
+    fn revised_partial_remains_provisional_until_matching_commit() {
+        let mut reconciler = TranscriptReconciler::new(true);
+        let events = process_all(
+            &mut reconciler,
+            [
+                WireMessage::Partial {
+                    text: "This is difficult.".to_string(),
+                },
+                WireMessage::Partial {
+                    text: "This is difficult because".to_string(),
+                },
+                WireMessage::Committed {
+                    text: "This is difficult because".to_string(),
+                },
+                WireMessage::Partial {
+                    text: "next".to_string(),
+                },
+            ],
+        );
+
+        assert_eq!(
+            events,
+            vec![
+                EventView::Partial("This is difficult.".to_string(), 0),
+                EventView::RevisePartial(1, " because".to_string(), 0),
+                EventView::Final(String::new(), 0),
+                EventView::Partial("next".to_string(), 1),
+            ]
+        );
+        assert_eq!(
+            (reconciler.typed_partial.as_str(), reconciler.segment_id),
+            ("next", 1)
+        );
     }
 
     #[test]
@@ -2276,6 +2448,12 @@ mod tests {
                 committed: "naïve",
                 expected_commit: EventView::Replace(1, "ve".to_string(), 0),
             },
+            Case {
+                name: "unicode scalar suffix retraction",
+                partial: "你好",
+                committed: "你们",
+                expected_commit: EventView::Replace(1, "们".to_string(), 0),
+            },
         ];
 
         for case in cases {
@@ -2306,16 +2484,19 @@ mod tests {
     }
 
     #[test]
-    fn committed_only_mode_ignores_partials_and_uses_sequential_segments() {
+    fn committed_only_mode_ignores_divergent_partials_and_uses_sequential_segments() {
         let mut reconciler = TranscriptReconciler::new(false);
         let events = process_all(
             &mut reconciler,
             [
                 WireMessage::Partial {
-                    text: "first dra".to_string(),
+                    text: "This is difficult.".to_string(),
+                },
+                WireMessage::Partial {
+                    text: "This is difficult because".to_string(),
                 },
                 WireMessage::Committed {
-                    text: "first draft".to_string(),
+                    text: "This is difficult because".to_string(),
                 },
                 WireMessage::Partial {
                     text: "second dra".to_string(),
@@ -2329,7 +2510,7 @@ mod tests {
         assert_eq!(
             events,
             vec![
-                EventView::Final("first draft".to_string(), 0),
+                EventView::Final("This is difficult because".to_string(), 0),
                 EventView::Final("second draft".to_string(), 1),
             ]
         );
@@ -2441,25 +2622,94 @@ mod tests {
     }
 
     #[test]
-    fn builds_pcm_batch_upload_with_fixed_fields() {
+    fn builds_pcm_batch_upload_with_fixed_fields_and_both_cleanup_values() {
         let samples = [-2.0, -0.5, 0.0, 0.5, 2.0];
         let expected_pcm: Vec<u8> = [-32767i16, -16384, 0, 16384, 32767]
             .into_iter()
             .flat_map(i16::to_le_bytes)
             .collect();
 
-        assert_eq!(
-            BatchUpload::new(&samples, Some("en".to_string())),
-            BatchUpload {
-                pcm16le: expected_pcm,
-                language_code: Some("en".to_string()),
-                model_id: "scribe_v2",
-                file_format: "pcm_s16le_16",
-                tag_audio_events: false,
-                diarize: false,
-                webhook: false,
-            }
-        );
+        for no_verbatim in [false, true] {
+            assert_eq!(
+                BatchUpload::new(&samples, Some("en".to_string()), no_verbatim),
+                BatchUpload {
+                    pcm16le: expected_pcm.clone(),
+                    language_code: Some("en".to_string()),
+                    model_id: "scribe_v2",
+                    file_format: "pcm_s16le_16",
+                    no_verbatim,
+                    tag_audio_events: false,
+                    diarize: false,
+                    webhook: false,
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn multipart_wire_body_includes_both_cleanup_values() {
+        async fn capture_multipart(no_verbatim: bool) -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                loop {
+                    let read = socket.read(&mut buffer).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    let Some(header_end) =
+                        request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                    else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .map(str::to_owned)
+                        })
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                        .expect("multipart request has a content length");
+                    if request.len() >= header_end + 4 + content_length {
+                        break;
+                    }
+                }
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+                request
+            });
+
+            let form = BatchUpload::new(
+                &[0.0; MIN_BATCH_SAMPLES],
+                Some("en".to_string()),
+                no_verbatim,
+            )
+            .into_multipart()
+            .unwrap();
+            let response = reqwest::Client::new()
+                .post(format!("http://{address}/upload"))
+                .multipart(form)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            String::from_utf8(server.await.unwrap()).unwrap()
+        }
+
+        for no_verbatim in [false, true] {
+            let request = capture_multipart(no_verbatim).await;
+            let expected_field = format!("name=\"no_verbatim\"\r\n\r\n{}\r\n", no_verbatim);
+            assert!(request.contains(&expected_field), "{request}");
+            assert!(!request.contains(API_KEY));
+        }
     }
 
     #[test]
@@ -2478,7 +2728,11 @@ mod tests {
 
         for (region, expected_host) in cases {
             let config = batch_config(region);
-            let upload = BatchUpload::new(&[0.0; MIN_BATCH_SAMPLES], config.language_code.clone());
+            let upload = BatchUpload::new(
+                &[0.0; MIN_BATCH_SAMPLES],
+                config.language_code.clone(),
+                config.no_verbatim,
+            );
             let request = build_batch_request(&client, &config, API_KEY, upload).unwrap();
             let uri = request.url().as_str();
 
@@ -2795,6 +3049,51 @@ mod tests {
         assert_eq!(
             lifecycle.decide(SessionSignal::DrainDeadlineElapsed),
             SessionDecision::EndCleanly
+        );
+    }
+
+    #[test]
+    fn final_drain_discards_stale_partial_after_a_qualified_commit() {
+        let mut lifecycle = RealtimeLifecycle::new();
+        lifecycle.connected();
+        lifecycle.session_started();
+        lifecycle.begin_finalization();
+        lifecycle.explicit_commit_sent();
+        let mut reconciler = TranscriptReconciler::new(true);
+
+        let provisional = process_incoming_text(
+            r#"{"message_type":"partial_transcript","text":"already committed"}"#,
+            API_KEY,
+            &mut reconciler,
+        )
+        .unwrap();
+        let committed = process_incoming_text(
+            r#"{"message_type":"committed_transcript","text":"already committed"}"#,
+            API_KEY,
+            &mut reconciler,
+        )
+        .unwrap();
+        assert!(lifecycle.note_committed());
+
+        let stale = process_final_drain_text(
+            r#"{"message_type":"partial_transcript","text":"already committed"}"#,
+            API_KEY,
+            &mut reconciler,
+            &lifecycle,
+        )
+        .unwrap();
+
+        assert_eq!(
+            (
+                provisional.events.len(),
+                committed.events.len(),
+                committed.committed,
+                stale.events.is_empty(),
+                stale.committed,
+                reconciler.typed_partial.as_str(),
+                reconciler.segment_id,
+            ),
+            (1, 1, true, true, false, "", 1),
         );
     }
 
