@@ -1472,7 +1472,6 @@ Select one of three dictation modes:
 - `realtime`: stream audio and type only committed segments.
 - `partials`: stream audio and type provisional text while you speak.
 
-
 All three modes support `[hotkey] mode = "push_to_talk"` when the built-in
 hotkey listener is enabled. It reads the physical release directly from evdev,
 so ElevenLabs realtime output cannot hide the release event. After release,
@@ -1484,18 +1483,84 @@ held-key tracking in Hyprland, Sway, and River before their release binding
 fires. `batch` mode does not type while the key is held and remains safe with
 compositor-managed push-to-talk.
 
+Use `mode = "realtime"` when you want committed text without provisional
+cursor edits. Use `mode = "partials"` when you want live text and accept that
+the provider may revise its provisional tail.
+
+### commit_strategy
+
+**Type:** String
+**Default:** `"vad"`
+
+Controls when the realtime API commits a segment:
+
+- `vad`: ElevenLabs commits after detected silence. This preserves existing
+  behavior and uses `vad_silence_threshold_secs`.
+- `manual`: VoxType keeps the segment open until recording stops and sends an
+  explicit commit. ElevenLabs can also commit automatically after about 36
+  seconds of accumulated audio.
+
+Manual commit with partial typing is the recommended setup for provider-driven
+live cleanup:
+
+```toml
+[elevenlabs]
+mode = "partials"
+commit_strategy = "manual"
+no_verbatim = true
+```
+
+An open manual segment lets later partial snapshots use speech after a pause to
+revise punctuation, words, or disfluencies. The model may keep its earlier
+choice, so this setting does not guarantee a specific punctuation change.
+ElevenLabs cannot revise a segment that it has already committed.
+
+With `mode = "realtime"` and `commit_strategy = "manual"`, text normally
+waits until recording stops or ElevenLabs performs its long-session automatic
+commit.
+
+### no_verbatim
+
+**Type:** Boolean
+**Default:** `false`
+
+When `true`, ElevenLabs removes provider-detected filler words, false starts,
+and disfluencies. This setting applies to batch and realtime requests and works
+independently of `commit_strategy`. The default preserves verbatim output.
+
+Provider cleanup is broader and less configurable than VoxType's local
+`[text] filler_words` list. It is useful for streaming modes because streaming
+text bypasses the local whole-transcript text processor.
+
 ### vad_silence_threshold_secs
 
 **Type:** Float
 **Default:** `1.5`
 
-Seconds of silence before ElevenLabs commits the current segment in `realtime` or `partials` mode. Lower values type committed text sooner but may split speech at short pauses. The value must be positive and finite.
+Seconds of silence before ElevenLabs commits the current segment when
+`commit_strategy = "vad"`. Lower values type committed text sooner but may
+split speech at short pauses. The value must be positive and finite.
+
+The setting remains valid for configuration compatibility when
+`commit_strategy = "manual"`, but VoxType omits it from the realtime request.
 
 ```toml
 [elevenlabs]
 mode = "partials"
+commit_strategy = "vad"
 vad_silence_threshold_secs = 0.8
 ```
+
+### Partial correction output
+
+Live partial revisions need a driver that can send BackSpace: `wtype`,
+`dotool` or `dotoolc`, or `ydotool`. VoxType paces correction keys with
+`[output] type_delay_ms`. `eitype` and clipboard-only output do not provide
+the streaming BackSpace fallback.
+
+If a revision cannot be applied, VoxType stops that streaming session, leaves
+the visible text in place, shows one error, and returns to idle. It does not
+rewind after provider and cursor state diverge.
 
 ### Configuration Summary
 
@@ -1505,6 +1570,8 @@ vad_silence_threshold_secs = 0.8
 | `region` | `--elevenlabs-region` | `VOXTYPE_ELEVENLABS_REGION` | `"global"` | API region |
 | `language_code` | `--elevenlabs-language` | `VOXTYPE_ELEVENLABS_LANGUAGE` | none | Language hint |
 | `mode` | `--elevenlabs-mode` | `VOXTYPE_ELEVENLABS_MODE` | `"realtime"` | `batch`, `realtime`, or `partials` |
+| `commit_strategy` | `--elevenlabs-commit-strategy` | `VOXTYPE_ELEVENLABS_COMMIT_STRATEGY` | `"vad"` | Realtime commit strategy |
+| `no_verbatim` | `--elevenlabs-no-verbatim` / `--elevenlabs-verbatim` | `VOXTYPE_ELEVENLABS_NO_VERBATIM` | `false` | Provider disfluency cleanup |
 | `vad_silence_threshold_secs` | `--elevenlabs-vad-silence-threshold-secs` | `VOXTYPE_ELEVENLABS_VAD_SILENCE_THRESHOLD_SECS` | `1.5` | Silence before a VAD commit |
 
 ### Complete Example
@@ -1515,10 +1582,14 @@ engine = "elevenlabs"
 [hotkey]
 mode = "push_to_talk"
 
+[output]
+type_delay_ms = 17
+
 [elevenlabs]
 language_code = "en"
 mode = "partials"
-vad_silence_threshold_secs = 0.8
+commit_strategy = "manual"
+no_verbatim = true
 # Set the API key with ELEVENLABS_API_KEY
 ```
 
@@ -3341,6 +3412,18 @@ Any config file setting can be overridden via environment variable. These are ap
 | `VOXTYPE_ON_DEMAND_LOADING` | bool | `whisper.on_demand_loading` |
 | `VOXTYPE_REMOTE_ENDPOINT` | string | `whisper.remote_endpoint` |
 | `VOXTYPE_WHISPER_API_KEY` | string | `whisper.remote_api_key` |
+
+**ElevenLabs:**
+
+| Variable | Type | Config equivalent |
+|----------|------|-------------------|
+| `ELEVENLABS_API_KEY` | string | `elevenlabs.api_key` |
+| `VOXTYPE_ELEVENLABS_REGION` | string | `elevenlabs.region` |
+| `VOXTYPE_ELEVENLABS_LANGUAGE` | string | `elevenlabs.language_code` |
+| `VOXTYPE_ELEVENLABS_MODE` | string | `elevenlabs.mode` |
+| `VOXTYPE_ELEVENLABS_COMMIT_STRATEGY` | string | `elevenlabs.commit_strategy` |
+| `VOXTYPE_ELEVENLABS_NO_VERBATIM` | bool | `elevenlabs.no_verbatim` |
+| `VOXTYPE_ELEVENLABS_VAD_SILENCE_THRESHOLD_SECS` | float | `elevenlabs.vad_silence_threshold_secs` |
 
 **Audio:**
 
