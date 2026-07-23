@@ -1472,7 +1472,6 @@ Select one of three dictation modes:
 - `realtime`: stream audio and type only committed segments.
 - `partials`: stream audio and type provisional text while you speak.
 
-Older `streaming` and `type_partials` fields remain accepted. When `mode` appears with either legacy field, `mode` wins.
 
 All three modes support `[hotkey] mode = "push_to_talk"` when the built-in
 hotkey listener is enabled. It reads the physical release directly from evdev,

@@ -234,13 +234,7 @@ pub struct Cli {
         value_name = "MODE",
         value_parser = ["batch", "realtime", "partials"],
         help_heading = "ElevenLabs",
-        hide_short_help = true,
-        conflicts_with_all = [
-            "elevenlabs_streaming",
-            "no_elevenlabs_streaming",
-            "elevenlabs_type_partials",
-            "no_elevenlabs_type_partials",
-        ]
+        hide_short_help = true
     )]
     pub elevenlabs_mode: Option<String>,
 
@@ -253,42 +247,6 @@ pub struct Cli {
         hide_short_help = true
     )]
     pub elevenlabs_vad_silence_threshold_secs: Option<f32>,
-
-    /// Use ElevenLabs realtime transcription for dictation
-    #[arg(
-        long,
-        help_heading = "ElevenLabs",
-        hide_short_help = true,
-        conflicts_with_all = ["no_elevenlabs_streaming", "elevenlabs_mode"]
-    )]
-    pub elevenlabs_streaming: bool,
-
-    /// Use ElevenLabs batch transcription for dictation
-    #[arg(
-        long,
-        help_heading = "ElevenLabs",
-        hide_short_help = true,
-        conflicts_with_all = ["elevenlabs_streaming", "elevenlabs_mode"]
-    )]
-    pub no_elevenlabs_streaming: bool,
-
-    /// Type stable ElevenLabs partial transcript extensions before commit
-    #[arg(
-        long,
-        help_heading = "ElevenLabs",
-        hide_short_help = true,
-        conflicts_with_all = ["no_elevenlabs_type_partials", "elevenlabs_mode"]
-    )]
-    pub elevenlabs_type_partials: bool,
-
-    /// Type only committed ElevenLabs transcript segments
-    #[arg(
-        long,
-        help_heading = "ElevenLabs",
-        hide_short_help = true,
-        conflicts_with_all = ["elevenlabs_type_partials", "elevenlabs_mode"]
-    )]
-    pub no_elevenlabs_type_partials: bool,
 
     // -- Hotkey --
     /// Override hotkey (e.g., SCROLLLOCK, PAUSE, F13, MEDIA, WEV_234, EVTEST_226)

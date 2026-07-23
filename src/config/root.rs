@@ -150,7 +150,7 @@ impl Config {
             TranscriptionEngine::ElevenLabs => self
                 .elevenlabs
                 .as_ref()
-                .map(ElevenLabsConfig::streaming_enabled)
+                .map(ElevenLabsConfig::uses_realtime_api)
                 .unwrap_or(false),
             _ => false,
         }

@@ -190,14 +190,12 @@ pub fn load_config(path: Option<&Path>) -> Result<Config, VoxtypeError> {
 
     // ElevenLabs. Any provider-specific environment value materializes the
     // optional section so environment-only source-build configurations work.
-    const ELEVENLABS_ENV_VARS: [&str; 7] = [
+    const ELEVENLABS_ENV_VARS: [&str; 5] = [
         "ELEVENLABS_API_KEY",
         "VOXTYPE_ELEVENLABS_REGION",
         "VOXTYPE_ELEVENLABS_LANGUAGE",
         "VOXTYPE_ELEVENLABS_MODE",
         "VOXTYPE_ELEVENLABS_VAD_SILENCE_THRESHOLD_SECS",
-        "VOXTYPE_ELEVENLABS_STREAMING",
-        "VOXTYPE_ELEVENLABS_TYPE_PARTIALS",
     ];
     if ELEVENLABS_ENV_VARS
         .iter()
@@ -223,14 +221,6 @@ pub fn load_config(path: Option<&Path>) -> Result<Config, VoxtypeError> {
                 Ok(mode) => elevenlabs.mode = mode,
                 Err(_) => tracing::warn!("Unknown VOXTYPE_ELEVENLABS_MODE value: {}", mode),
             }
-        } else {
-            let streaming = std::env::var("VOXTYPE_ELEVENLABS_STREAMING")
-                .ok()
-                .map(|value| parse_bool_env(&value));
-            let type_partials = std::env::var("VOXTYPE_ELEVENLABS_TYPE_PARTIALS")
-                .ok()
-                .map(|value| parse_bool_env(&value));
-            elevenlabs.apply_legacy_mode_overrides(streaming, type_partials);
         }
         if let Ok(value) = std::env::var("VOXTYPE_ELEVENLABS_VAD_SILENCE_THRESHOLD_SECS") {
             match value.parse::<f32>() {

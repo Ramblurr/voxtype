@@ -222,7 +222,7 @@ impl Transcriber for ElevenLabsTranscriber {
     }
 
     fn as_streaming(&self) -> Option<&dyn StreamingTranscriber> {
-        self.config.streaming_enabled().then_some(self as _)
+        self.config.uses_realtime_api().then_some(self as _)
     }
 }
 
@@ -233,7 +233,7 @@ impl StreamingTranscriber for ElevenLabsTranscriber {
     ) -> Result<StreamHandle, TranscribeError> {
         let request = realtime_request(&self.config, &self.api_key)?;
         let api_key = self.api_key.clone();
-        let type_partials = self.config.type_partials_enabled();
+        let type_partials = self.config.types_partial_transcripts();
         let (events_tx, events_rx) = mpsc::channel(STREAM_EVENT_CHANNEL_CAPACITY);
         let (cancel_tx, cancel_rx) = oneshot::channel();
 

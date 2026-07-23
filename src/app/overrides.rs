@@ -177,10 +177,6 @@ pub(crate) fn apply_cli_overrides(config: &mut config::Config, cli: &Cli) -> Opt
         || cli.elevenlabs_language.is_some()
         || cli.elevenlabs_mode.is_some()
         || cli.elevenlabs_vad_silence_threshold_secs.is_some()
-        || cli.elevenlabs_streaming
-        || cli.no_elevenlabs_streaming
-        || cli.elevenlabs_type_partials
-        || cli.no_elevenlabs_type_partials
     {
         let elevenlabs = config
             .elevenlabs
@@ -201,22 +197,6 @@ pub(crate) fn apply_cli_overrides(config: &mut config::Config, cli: &Cli) -> Opt
             elevenlabs.mode = mode
                 .parse::<config::ElevenLabsMode>()
                 .expect("validated ElevenLabs mode");
-        } else {
-            let streaming = if cli.elevenlabs_streaming {
-                Some(true)
-            } else if cli.no_elevenlabs_streaming {
-                Some(false)
-            } else {
-                None
-            };
-            let type_partials = if cli.elevenlabs_type_partials {
-                Some(true)
-            } else if cli.no_elevenlabs_type_partials {
-                Some(false)
-            } else {
-                None
-            };
-            elevenlabs.apply_legacy_mode_overrides(streaming, type_partials);
         }
         if let Some(value) = cli.elevenlabs_vad_silence_threshold_secs {
             elevenlabs
@@ -381,14 +361,12 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
-    const ELEVENLABS_ENV_VARS: [&str; 7] = [
+    const ELEVENLABS_ENV_VARS: [&str; 5] = [
         "ELEVENLABS_API_KEY",
         "VOXTYPE_ELEVENLABS_REGION",
         "VOXTYPE_ELEVENLABS_LANGUAGE",
         "VOXTYPE_ELEVENLABS_MODE",
         "VOXTYPE_ELEVENLABS_VAD_SILENCE_THRESHOLD_SECS",
-        "VOXTYPE_ELEVENLABS_STREAMING",
-        "VOXTYPE_ELEVENLABS_TYPE_PARTIALS",
     ];
 
     struct EnvRestore(Vec<(&'static str, Option<OsString>)>);
@@ -462,7 +440,7 @@ mod tests {
     }
 
     #[test]
-    fn elevenlabs_legacy_cli_flags_materialize_absent_section() {
+    fn elevenlabs_mode_flag_materializes_absent_section() {
         let _lock = ENV_MUTEX.lock().unwrap();
         let _env = EnvRestore::set(&[]);
         let mut config = load_without_config_file();
@@ -472,8 +450,8 @@ mod tests {
             "voxtype",
             "--elevenlabs-region",
             "us",
-            "--no-elevenlabs-streaming",
-            "--elevenlabs-type-partials",
+            "--elevenlabs-mode",
+            "batch",
         ])
         .unwrap();
         apply_cli_overrides(&mut config, &cli);
@@ -539,22 +517,7 @@ mod tests {
     }
 
     #[test]
-    fn elevenlabs_legacy_environment_booleans_remain_supported() {
-        let _lock = ENV_MUTEX.lock().unwrap();
-        let _env = EnvRestore::set(&[
-            ("VOXTYPE_ELEVENLABS_STREAMING", Some("true")),
-            ("VOXTYPE_ELEVENLABS_TYPE_PARTIALS", Some("true")),
-        ]);
-
-        let config = load_without_config_file();
-        assert_eq!(
-            config.elevenlabs.unwrap().mode,
-            config::ElevenLabsMode::Partials
-        );
-    }
-
-    #[test]
-    fn elevenlabs_cli_rejects_invalid_modes_and_thresholds() {
+    fn elevenlabs_cli_rejects_invalid_values() {
         assert!(Cli::try_parse_from(["voxtype", "--elevenlabs-mode", "continuous",]).is_err());
         for invalid in ["0", "-0.1", "NaN", "inf"] {
             assert!(Cli::try_parse_from([

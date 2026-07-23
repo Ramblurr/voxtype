@@ -60,7 +60,8 @@ pub enum ElevenLabsMode {
 
 /// ElevenLabs Scribe cloud transcription configuration.
 /// Requires: cargo build --features elevenlabs
-#[derive(Clone, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct ElevenLabsConfig {
     /// API key sent in the sensitive `xi-api-key` header.
     pub api_key: Option<String>,
@@ -69,67 +70,15 @@ pub struct ElevenLabsConfig {
     pub region: ElevenLabsRegion,
 
     /// Optional ISO 639-1 or ISO 639-3 language hint.
+    #[serde(deserialize_with = "deserialize_language_code")]
     pub language_code: Option<String>,
 
     /// Dictation behavior. Default: `realtime`.
     pub mode: ElevenLabsMode,
 
     /// Silence required before VAD commits a realtime segment. Default: 1.5 seconds.
+    #[serde(deserialize_with = "deserialize_vad_silence_threshold_secs")]
     pub vad_silence_threshold_secs: f32,
-}
-
-#[derive(Deserialize)]
-struct RawElevenLabsConfig {
-    #[serde(default)]
-    api_key: Option<String>,
-    #[serde(default)]
-    region: ElevenLabsRegion,
-    #[serde(default, deserialize_with = "deserialize_language_code")]
-    language_code: Option<String>,
-    #[serde(default)]
-    mode: Option<ElevenLabsMode>,
-    #[serde(default)]
-    streaming: Option<bool>,
-    #[serde(default)]
-    type_partials: Option<bool>,
-    #[serde(default = "default_vad_silence_threshold_secs")]
-    vad_silence_threshold_secs: f32,
-}
-
-impl<'de> Deserialize<'de> for ElevenLabsConfig {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let raw = RawElevenLabsConfig::deserialize(deserializer)?;
-        let mode = raw.mode.unwrap_or_else(|| {
-            ElevenLabsMode::from_legacy(
-                raw.streaming.unwrap_or(true),
-                raw.type_partials.unwrap_or(false),
-            )
-        });
-        let config = Self {
-            api_key: raw.api_key,
-            region: raw.region,
-            language_code: raw.language_code,
-            mode,
-            vad_silence_threshold_secs: raw.vad_silence_threshold_secs,
-        };
-        config.validate().map_err(D::Error::custom)?;
-        Ok(config)
-    }
-}
-
-impl ElevenLabsMode {
-    fn from_legacy(streaming: bool, type_partials: bool) -> Self {
-        if !streaming {
-            Self::Batch
-        } else if type_partials {
-            Self::Partials
-        } else {
-            Self::Realtime
-        }
-    }
 }
 
 impl ElevenLabsConfig {
@@ -139,25 +88,13 @@ impl ElevenLabsConfig {
     }
 
     /// Whether this mode uses the realtime WebSocket API.
-    pub fn streaming_enabled(&self) -> bool {
+    pub fn uses_realtime_api(&self) -> bool {
         self.mode != ElevenLabsMode::Batch
     }
 
     /// Whether provisional transcript extensions should be typed.
-    pub fn type_partials_enabled(&self) -> bool {
+    pub fn types_partial_transcripts(&self) -> bool {
         self.mode == ElevenLabsMode::Partials
-    }
-
-    /// Apply the legacy boolean controls without creating meaningless modes.
-    pub fn apply_legacy_mode_overrides(
-        &mut self,
-        streaming: Option<bool>,
-        type_partials: Option<bool>,
-    ) {
-        self.mode = ElevenLabsMode::from_legacy(
-            streaming.unwrap_or_else(|| self.streaming_enabled()),
-            type_partials.unwrap_or_else(|| self.type_partials_enabled()),
-        );
     }
 
     /// Set and validate the VAD silence threshold.
@@ -211,6 +148,15 @@ fn validate_vad_silence_threshold_secs(value: f32) -> Result<(), String> {
     } else {
         Err("ElevenLabs vad_silence_threshold_secs must be a positive finite number".to_string())
     }
+}
+
+fn deserialize_vad_silence_threshold_secs<'de, D>(deserializer: D) -> Result<f32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = f32::deserialize(deserializer)?;
+    validate_vad_silence_threshold_secs(value).map_err(D::Error::custom)?;
+    Ok(value)
 }
 
 fn normalize_language_code(value: &str) -> Option<String> {
@@ -315,8 +261,8 @@ mod tests {
             assert_eq!(
                 (
                     config.mode,
-                    config.streaming_enabled(),
-                    config.type_partials_enabled(),
+                    config.uses_realtime_api(),
+                    config.types_partial_transcripts(),
                 ),
                 (expected_mode, expected_streaming, expected_partials),
             );
@@ -326,29 +272,8 @@ mod tests {
     }
 
     #[test]
-    fn legacy_streaming_booleans_map_to_canonical_modes() {
-        let cases = [
-            ("streaming = false", ElevenLabsMode::Batch),
-            ("streaming = true", ElevenLabsMode::Realtime),
-            (
-                "streaming = true\ntype_partials = true",
-                ElevenLabsMode::Partials,
-            ),
-            (
-                "streaming = false\ntype_partials = true",
-                ElevenLabsMode::Batch,
-            ),
-        ];
-
-        for (toml, expected) in cases {
-            let config: ElevenLabsConfig = toml::from_str(toml).unwrap();
-            assert_eq!(config.mode, expected);
-        }
-
-        let canonical: ElevenLabsConfig =
-            toml::from_str("mode = \"partials\"\nstreaming = false\ntype_partials = false")
-                .unwrap();
-        assert_eq!(canonical.mode, ElevenLabsMode::Partials);
+    fn rejects_unknown_keys() {
+        assert!(toml::from_str::<ElevenLabsConfig>("unexpected = true").is_err());
     }
 
     #[test]
@@ -366,7 +291,7 @@ mod tests {
     }
 
     #[test]
-    fn serialization_uses_mode_instead_of_legacy_booleans() {
+    fn serialization_includes_mode_and_vad_threshold() {
         let config = ElevenLabsConfig {
             mode: ElevenLabsMode::Partials,
             vad_silence_threshold_secs: 0.75,
@@ -376,8 +301,6 @@ mod tests {
         let serialized = toml::to_string(&config).unwrap();
         assert!(serialized.contains("mode = \"partials\""));
         assert!(serialized.contains("vad_silence_threshold_secs = 0.75"));
-        assert!(!serialized.contains("\nstreaming ="));
-        assert!(!serialized.contains("\ntype_partials ="));
     }
 
     #[test]
