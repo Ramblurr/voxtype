@@ -64,20 +64,22 @@ pub type SegmentId = u64;
 /// is not needed in normal use.
 #[derive(Debug)]
 pub enum StreamingEvent {
-    /// In-progress text for a segment. May be revised by later partials
-    /// or superseded by a `Final` event with the same `segment_id`.
+    /// An append-only delta for the in-progress text of a segment. `text`
+    /// contains only the suffix not emitted by earlier events for this
+    /// segment. Backends must reconcile revisable provider snapshots before
+    /// emitting them as `Partial` events.
     Partial { text: String, segment_id: SegmentId },
 
-    /// Committed text for a segment. The daemon's default output policy
-    /// is to type only `Final` segments, so revision-style providers do
-    /// not produce visible churn.
+    /// A committed delta for a segment. `text` contains only the final suffix
+    /// not already emitted as `Partial`; when no partial was emitted, it is
+    /// the full committed segment. An empty delta commits the accumulated
+    /// partial without typing it again and clears the segment's partial state.
     Final { text: String, segment_id: SegmentId },
 
-    /// Backspace `backspace` chars then commit `text`. Used by streaming
-    /// backends (notably Soniox) that revise the tail of a previously
-    /// typed non-final tail when finalizing — e.g. punctuation flips
-    /// from `,` to `.` or a token spelling changes between non-final
-    /// and final. Equivalent to `Final` when `backspace == 0`.
+    /// Replace a corrected tail and commit the segment. `backspace` is the
+    /// number of Unicode scalar values to remove from the partial text already
+    /// emitted for this segment, and `text` is the corrected final suffix to
+    /// append. The retained partial prefix plus `text` becomes finalized.
     Replace {
         backspace: usize,
         text: String,

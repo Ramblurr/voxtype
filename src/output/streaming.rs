@@ -168,6 +168,7 @@ impl StreamingSession {
         post_output_command: Option<&str>,
     ) -> Result<(), OutputError> {
         if text.is_empty() {
+            self.finalized_text.push_str(&self.partial);
             self.clear_partial();
             return Ok(());
         }
@@ -470,6 +471,33 @@ mod tests {
             .unwrap();
         assert!(rec.typed().is_empty());
         assert_eq!(session.typed_chars(), 0);
+    }
+
+    #[tokio::test]
+    async fn empty_final_commits_typed_partial_without_duplicate_output() {
+        let rec = std::sync::Arc::new(RecordingOutput::new());
+        let chain = chain_with(rec.clone());
+        let mut session = StreamingSession::new();
+
+        session
+            .type_partial_delta(&chain, "hello".into(), None, None)
+            .await
+            .unwrap();
+        session
+            .commit_segment(&chain, "", None, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(rec.typed(), vec!["hello".to_string()]);
+        assert_eq!(session.finalized_text(), "hello");
+        assert_eq!(session.typed_chars(), 5);
+        assert_eq!(session.partial(), "");
+
+        session
+            .type_partial_delta(&chain, "next".into(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(session.partial(), "next");
     }
 
     #[tokio::test]
