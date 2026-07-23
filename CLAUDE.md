@@ -368,12 +368,6 @@ Based on open issues and project direction.
 
 ---
 
-## Git Commits
-
-- **NEVER commit without GPG signing.** All commits must be signed. Do not use `--no-gpg-sign` or skip signing for any reason.
-- **Pull requests with unsigned commits will be rejected.** Every commit in a PR must be signed.
-- If GPG signing fails, stop and inform the user rather than bypassing signing.
-
 ### Crediting Contributors
 
 When work builds on contributions from others, always include appropriate credit:
