@@ -160,11 +160,32 @@ struct DeviceManager {
     inotify_buffer: [u8; 1024],
     /// Last time we did a full validation
     last_validation: Instant,
+    /// Keys relevant to this listener, including target and modifiers
+    watched_keys: HashSet<Key>,
+}
+
+fn is_relevant_device(
+    supported_keys: impl IntoIterator<Item = Key>,
+    watched_keys: &HashSet<Key>,
+) -> bool {
+    let mut has_a = false;
+    let mut has_z = false;
+    let mut has_enter = false;
+    let mut has_watched_key = false;
+
+    for key in supported_keys {
+        has_a |= key == Key::KEY_A;
+        has_z |= key == Key::KEY_Z;
+        has_enter |= key == Key::KEY_ENTER;
+        has_watched_key |= watched_keys.contains(&key);
+    }
+
+    (has_a && has_z && has_enter) || has_watched_key
 }
 
 impl DeviceManager {
     /// Create a new device manager with inotify watcher
-    fn new() -> Result<Self, HotkeyError> {
+    fn new(watched_keys: HashSet<Key>) -> Result<Self, HotkeyError> {
         let inotify = Inotify::init().map_err(|e| {
             HotkeyError::DeviceAccess(format!("Failed to initialize inotify: {}", e))
         })?;
@@ -180,6 +201,7 @@ impl DeviceManager {
             inotify,
             inotify_buffer: [0u8; 1024],
             last_validation: Instant::now(),
+            watched_keys,
         };
 
         // Initial device enumeration
@@ -216,29 +238,23 @@ impl DeviceManager {
                 continue;
             }
 
-            // Try to open and check if it's a keyboard
+            // Open standard keyboards and devices that emit a configured key.
             self.try_open_device(&path);
         }
 
         Ok(())
     }
 
-    /// Try to open a device and add it if it's a keyboard
+    /// Try to open a relevant input device.
     fn try_open_device(&mut self, path: &PathBuf) {
         match Device::open(path) {
             Ok(device) => {
-                // Check if device has keyboard capabilities
-                let has_keys = device
+                let is_relevant = device
                     .supported_keys()
-                    .map(|keys| {
-                        // A keyboard should have at least some letter keys
-                        keys.contains(Key::KEY_A)
-                            && keys.contains(Key::KEY_Z)
-                            && keys.contains(Key::KEY_ENTER)
-                    })
+                    .map(|keys| is_relevant_device(keys.iter(), &self.watched_keys))
                     .unwrap_or(false);
 
-                if has_keys {
+                if is_relevant {
                     // Set device to non-blocking mode
                     let fd = device.as_raw_fd();
                     unsafe {
@@ -402,7 +418,13 @@ fn evdev_listener_loop(
     tx: mpsc::Sender<HotkeyEvent>,
     mut stop_rx: oneshot::Receiver<()>,
 ) -> Result<(), HotkeyError> {
-    let mut manager = DeviceManager::new()?;
+    let mut watched_keys = modifier_keys.clone();
+    watched_keys.insert(target_key);
+    watched_keys.extend(cancel_key);
+    watched_keys.extend(model_modifier);
+    watched_keys.extend(profile_modifiers.keys().copied());
+
+    let mut manager = DeviceManager::new(watched_keys)?;
 
     // Track currently held modifier keys
     let mut active_modifiers: HashSet<Key> = HashSet::new();
@@ -809,6 +831,18 @@ mod tests {
         assert_eq!(parse_key_name("RECORD").unwrap(), Key::KEY_RECORD);
         assert_eq!(parse_key_name("FASTFORWARD").unwrap(), Key::KEY_FASTFORWARD);
         assert_eq!(parse_key_name("REWIND").unwrap(), Key::KEY_REWIND);
+    }
+
+    #[test]
+    fn relevant_device_accepts_standard_keyboards_and_configured_consumer_keys() {
+        let watched_keys = HashSet::from([Key::KEY_NEXTSONG]);
+
+        assert!(is_relevant_device(
+            [Key::KEY_A, Key::KEY_Z, Key::KEY_ENTER],
+            &watched_keys
+        ));
+        assert!(is_relevant_device([Key::KEY_NEXTSONG], &watched_keys));
+        assert!(!is_relevant_device([Key::KEY_PLAYPAUSE], &watched_keys));
     }
 
     #[test]
