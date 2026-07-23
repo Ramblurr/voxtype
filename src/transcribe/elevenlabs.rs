@@ -9,17 +9,30 @@
     reason = "protocol primitives are wired into transports in the following implementation tasks"
 )]
 
-use std::{sync::OnceLock, time::Duration};
+use std::{
+    collections::VecDeque,
+    future::{pending, Future},
+    sync::OnceLock,
+    time::Duration,
+};
 
 use base64::Engine as _;
+use futures_util::{FutureExt, Sink, SinkExt, StreamExt};
 use reqwest::{
     header::{HeaderName, HeaderValue},
     StatusCode,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use tokio_tungstenite::tungstenite::{client::IntoClientRequest, http::Request};
+use tokio::{
+    net::TcpStream,
+    sync::{mpsc, oneshot},
+};
+use tokio_tungstenite::{
+    tungstenite::{client::IntoClientRequest, http::Request, Error as WebSocketError, Message},
+    MaybeTlsStream, WebSocketStream,
+};
 
-use super::{SegmentId, StreamingEvent, Transcriber};
+use super::{SegmentId, StreamHandle, StreamingEvent, StreamingTranscriber, Transcriber};
 use crate::{
     config::{ElevenLabsConfig, ElevenLabsRegion},
     error::TranscribeError,
@@ -44,6 +57,14 @@ const MIN_BATCH_SAMPLES: usize = SAMPLE_RATE as usize / 10;
 const BATCH_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_PROVIDER_ERROR_CHARS: usize = 512;
 const API_KEY_HEADER: HeaderName = HeaderName::from_static("xi-api-key");
+const SESSION_START_TIMEOUT: Duration = Duration::from_secs(10);
+const PRE_SESSION_AUDIO_LIMIT_SAMPLES: usize = SAMPLE_RATE as usize * 10;
+const FINAL_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+const POST_FINAL_QUIET_PERIOD: Duration = Duration::from_secs(1);
+const STREAM_EVENT_CHANNEL_CAPACITY: usize = 64;
+const WEBSOCKET_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+// Keep finalization responsive even if the provider has a large ready backlog.
+const MAX_PRE_COMMIT_DRAIN_MESSAGES: usize = 64;
 
 fn api_origin(region: ElevenLabsRegion) -> &'static str {
     match region {
@@ -200,6 +221,46 @@ impl Transcriber for ElevenLabsTranscriber {
                 runtime.block_on(run)
             }
         }
+    }
+}
+
+impl StreamingTranscriber for ElevenLabsTranscriber {
+    fn start_stream(
+        &self,
+        samples_rx: mpsc::Receiver<Vec<f32>>,
+    ) -> Result<StreamHandle, TranscribeError> {
+        let request = realtime_request(&self.config, &self.api_key)?;
+        let api_key = self.api_key.clone();
+        let type_partials = self.config.type_partials;
+        let (events_tx, events_rx) = mpsc::channel(STREAM_EVENT_CHANNEL_CAPACITY);
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+
+        let task = tokio::spawn(async move {
+            // Reserve both fatal-epilogue slots before normal traffic. The
+            // daemon awaits cancellation without polling events, so neither
+            // Error nor Ended may depend on free capacity at shutdown.
+            let Some(epilogue) = StreamEpilogue::reserve(&events_tx) else {
+                return Ok(());
+            };
+            let exit = run_streaming_session(
+                request,
+                &api_key,
+                type_partials,
+                samples_rx,
+                &events_tx,
+                cancel_rx,
+            )
+            .await;
+
+            epilogue.finish(exit);
+            Ok(())
+        });
+
+        Ok(StreamHandle {
+            events: events_rx,
+            cancel: cancel_tx,
+            task,
+        })
     }
 }
 
@@ -432,6 +493,78 @@ impl PcmFrameAccumulator {
     }
 }
 
+#[derive(Debug, Default)]
+struct RealtimeAudioEncoder {
+    frames: PcmFrameAccumulator,
+    final_commit_sent: bool,
+}
+
+impl RealtimeAudioEncoder {
+    fn push(&mut self, samples: &[f32]) -> Result<Vec<String>, TranscribeError> {
+        if self.final_commit_sent {
+            return Err(TranscribeError::InferenceFailed(
+                "Cannot send ElevenLabs audio after the final commit".to_string(),
+            ));
+        }
+
+        self.frames
+            .push(samples)
+            .into_iter()
+            .map(|frame| serialize_audio_chunk(&frame))
+            .collect()
+    }
+
+    fn finish(&mut self) -> Result<Vec<String>, TranscribeError> {
+        if self.final_commit_sent {
+            return Ok(Vec::new());
+        }
+
+        let mut messages = Vec::with_capacity(2);
+        if let Some(tail) = self.frames.flush() {
+            messages.push(serialize_audio_chunk(&tail)?);
+        }
+        messages.push(serialize_final_commit()?);
+        self.final_commit_sent = true;
+        Ok(messages)
+    }
+}
+
+#[derive(Debug, Default)]
+struct PreSessionAudioBuffer {
+    chunks: VecDeque<Vec<f32>>,
+    sample_count: usize,
+}
+
+impl PreSessionAudioBuffer {
+    fn push(&mut self, chunk: Vec<f32>) -> Result<(), TranscribeError> {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+
+        let sample_count = self
+            .sample_count
+            .checked_add(chunk.len())
+            .ok_or_else(pre_session_overflow_error)?;
+        if sample_count > PRE_SESSION_AUDIO_LIMIT_SAMPLES {
+            return Err(pre_session_overflow_error());
+        }
+
+        self.sample_count = sample_count;
+        self.chunks.push_back(chunk);
+        Ok(())
+    }
+
+    fn into_chunks(self) -> VecDeque<Vec<f32>> {
+        self.chunks
+    }
+}
+
+fn pre_session_overflow_error() -> TranscribeError {
+    TranscribeError::InferenceFailed(
+        "ElevenLabs realtime startup exceeded the 10-second pre-session audio buffer".to_string(),
+    )
+}
+
 #[derive(Debug, Serialize)]
 struct InputAudioChunk {
     message_type: &'static str,
@@ -604,12 +737,8 @@ impl TranscriptReconciler {
             // are requested. The preceding event already finalized the segment.
             WireMessage::CommittedWithTimestamps { .. }
             | WireMessage::SessionStarted { .. }
+            | WireMessage::ProviderError { .. }
             | WireMessage::Unknown => Vec::new(),
-            WireMessage::ProviderError { kind, message } => {
-                vec![StreamingEvent::Error(TranscribeError::InferenceFailed(
-                    format!("ElevenLabs realtime {kind}: {message}"),
-                ))]
-            }
         }
     }
 
@@ -659,13 +788,1115 @@ fn common_prefix_char_count(left: &str, right: &str) -> usize {
         .count()
 }
 
+#[derive(Debug)]
+struct ProcessedIncoming {
+    events: Vec<StreamingEvent>,
+    committed: bool,
+}
+
+fn process_incoming_text(
+    payload: &str,
+    api_key: &str,
+    reconciler: &mut TranscriptReconciler,
+) -> Result<ProcessedIncoming, TranscribeError> {
+    let message = parse_wire_message(payload, api_key)?;
+    if let WireMessage::ProviderError { kind, message } = &message {
+        return Err(TranscribeError::InferenceFailed(format!(
+            "ElevenLabs realtime {kind}: {message}"
+        )));
+    }
+
+    let committed = matches!(message, WireMessage::Committed { .. });
+    Ok(ProcessedIncoming {
+        events: reconciler.process(message),
+        committed,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionPhase {
+    Connecting,
+    AwaitingSession,
+    Streaming,
+    FinalizingCommit,
+    DrainingAwaitingFinal,
+    DrainingQuiet,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionSignal {
+    Cancelled,
+    FatalError,
+    SocketClosed,
+    QuietPeriodElapsed,
+    DrainDeadlineElapsed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionFailure {
+    FatalError,
+    SocketClosedBeforeFinal,
+    FinalResponseTimeout,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionDecision {
+    Continue,
+    EndCleanly,
+    Fail(SessionFailure),
+}
+
+#[derive(Debug)]
+struct RealtimeLifecycle {
+    phase: SessionPhase,
+}
+
+impl RealtimeLifecycle {
+    fn new() -> Self {
+        Self {
+            phase: SessionPhase::Connecting,
+        }
+    }
+
+    fn connected(&mut self) {
+        self.phase = SessionPhase::AwaitingSession;
+    }
+
+    fn session_started(&mut self) {
+        self.phase = SessionPhase::Streaming;
+    }
+
+    fn begin_finalization(&mut self) {
+        self.phase = SessionPhase::FinalizingCommit;
+    }
+
+    fn explicit_commit_sent(&mut self) {
+        self.phase = SessionPhase::DrainingAwaitingFinal;
+    }
+
+    fn note_committed(&mut self) -> bool {
+        if matches!(
+            self.phase,
+            SessionPhase::DrainingAwaitingFinal | SessionPhase::DrainingQuiet
+        ) {
+            self.phase = SessionPhase::DrainingQuiet;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn decide(&self, signal: SessionSignal) -> SessionDecision {
+        match signal {
+            SessionSignal::Cancelled => SessionDecision::EndCleanly,
+            SessionSignal::FatalError => SessionDecision::Fail(SessionFailure::FatalError),
+            SessionSignal::SocketClosed => {
+                if self.phase == SessionPhase::DrainingQuiet {
+                    SessionDecision::EndCleanly
+                } else {
+                    SessionDecision::Fail(SessionFailure::SocketClosedBeforeFinal)
+                }
+            }
+            SessionSignal::QuietPeriodElapsed => {
+                if self.phase == SessionPhase::DrainingQuiet {
+                    SessionDecision::EndCleanly
+                } else {
+                    SessionDecision::Continue
+                }
+            }
+            SessionSignal::DrainDeadlineElapsed => match self.phase {
+                SessionPhase::FinalizingCommit | SessionPhase::DrainingAwaitingFinal => {
+                    SessionDecision::Fail(SessionFailure::FinalResponseTimeout)
+                }
+                SessionPhase::DrainingQuiet => SessionDecision::EndCleanly,
+                _ => SessionDecision::Continue,
+            },
+        }
+    }
+}
+
+#[derive(Debug)]
+enum SessionExit {
+    Clean,
+    Cancelled,
+    Fatal(TranscribeError),
+}
+
+struct StreamEpilogue {
+    error_permit: mpsc::OwnedPermit<StreamingEvent>,
+    ended_permit: mpsc::OwnedPermit<StreamingEvent>,
+}
+
+impl StreamEpilogue {
+    fn reserve(events_tx: &mpsc::Sender<StreamingEvent>) -> Option<Self> {
+        let error_permit = events_tx.clone().try_reserve_owned().ok()?;
+        let ended_permit = events_tx.clone().try_reserve_owned().ok()?;
+        Some(Self {
+            error_permit,
+            ended_permit,
+        })
+    }
+
+    fn finish(self, exit: SessionExit) {
+        let Self {
+            error_permit,
+            ended_permit,
+        } = self;
+        if let SessionExit::Fatal(error) = exit {
+            let _ = error_permit.send(StreamingEvent::Error(error));
+        } else {
+            drop(error_permit);
+        }
+        let _ = ended_permit.send(StreamingEvent::Ended);
+    }
+}
+
+fn cancelled_exit(lifecycle: &RealtimeLifecycle) -> SessionExit {
+    debug_assert_eq!(
+        lifecycle.decide(SessionSignal::Cancelled),
+        SessionDecision::EndCleanly
+    );
+    SessionExit::Cancelled
+}
+
+fn fatal_exit(lifecycle: &RealtimeLifecycle, error: TranscribeError) -> SessionExit {
+    debug_assert_eq!(
+        lifecycle.decide(SessionSignal::FatalError),
+        SessionDecision::Fail(SessionFailure::FatalError)
+    );
+    SessionExit::Fatal(error)
+}
+
+fn close_exit(lifecycle: &RealtimeLifecycle) -> SessionExit {
+    match lifecycle.decide(SessionSignal::SocketClosed) {
+        SessionDecision::EndCleanly => SessionExit::Clean,
+        SessionDecision::Fail(SessionFailure::SocketClosedBeforeFinal) => {
+            SessionExit::Fatal(TranscribeError::NetworkError(
+                "ElevenLabs realtime connection closed before the final commit response"
+                    .to_string(),
+            ))
+        }
+        _ => unreachable!("socket-close decision has an exhaustive lifecycle mapping"),
+    }
+}
+
+fn drain_timer_exit(lifecycle: &RealtimeLifecycle, signal: SessionSignal) -> Option<SessionExit> {
+    match lifecycle.decide(signal) {
+        SessionDecision::Continue => None,
+        SessionDecision::EndCleanly => Some(SessionExit::Clean),
+        SessionDecision::Fail(SessionFailure::FinalResponseTimeout) => {
+            Some(SessionExit::Fatal(TranscribeError::NetworkError(
+                "ElevenLabs realtime finalization timed out after 10 seconds".to_string(),
+            )))
+        }
+        SessionDecision::Fail(_) => {
+            unreachable!("drain timers cannot produce another failure")
+        }
+    }
+}
+
+fn should_attempt_close(exit: &SessionExit) -> bool {
+    matches!(exit, SessionExit::Clean)
+}
+
+struct CancelSignal {
+    receiver: Option<oneshot::Receiver<()>>,
+}
+
+impl CancelSignal {
+    fn new(receiver: oneshot::Receiver<()>) -> Self {
+        Self {
+            receiver: Some(receiver),
+        }
+    }
+
+    async fn requested(&mut self) {
+        loop {
+            let result = match self.receiver.as_mut() {
+                Some(receiver) => receiver.await,
+                None => pending().await,
+            };
+            if result.is_ok() {
+                return;
+            }
+            self.receiver = None;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AsyncDelivery {
+    Delivered,
+    Cancelled,
+    ReceiverClosed,
+    DeadlineElapsed,
+}
+
+async fn send_websocket_messages<S>(
+    write: &mut S,
+    messages: Vec<Message>,
+    cancel: &mut CancelSignal,
+    api_key: &str,
+) -> Result<AsyncDelivery, TranscribeError>
+where
+    S: Sink<Message, Error = WebSocketError> + Unpin,
+{
+    for message in messages {
+        tokio::select! {
+            biased;
+            _ = cancel.requested() => return Ok(AsyncDelivery::Cancelled),
+            result = write.send(message) => {
+                result.map_err(|error| websocket_error("send failed", error, api_key))?;
+            }
+        }
+    }
+    Ok(AsyncDelivery::Delivered)
+}
+
+async fn send_websocket_messages_until<S>(
+    write: &mut S,
+    messages: Vec<Message>,
+    cancel: &mut CancelSignal,
+    api_key: &str,
+    deadline: tokio::time::Instant,
+) -> Result<AsyncDelivery, TranscribeError>
+where
+    S: Sink<Message, Error = WebSocketError> + Unpin,
+{
+    for message in messages {
+        let deadline_timer = tokio::time::sleep_until(deadline);
+        tokio::pin!(deadline_timer);
+        tokio::select! {
+            biased;
+            _ = cancel.requested() => return Ok(AsyncDelivery::Cancelled),
+            _ = &mut deadline_timer => return Ok(AsyncDelivery::DeadlineElapsed),
+            result = write.send(message) => {
+                result.map_err(|error| websocket_error("send failed", error, api_key))?;
+            }
+        }
+    }
+    Ok(AsyncDelivery::Delivered)
+}
+
+async fn send_audio_messages<S>(
+    write: &mut S,
+    messages: Vec<String>,
+    cancel: &mut CancelSignal,
+    api_key: &str,
+) -> Result<AsyncDelivery, TranscribeError>
+where
+    S: Sink<Message, Error = WebSocketError> + Unpin,
+{
+    send_websocket_messages(
+        write,
+        messages.into_iter().map(Message::Text).collect(),
+        cancel,
+        api_key,
+    )
+    .await
+}
+
+async fn emit_streaming_events(
+    events_tx: &mpsc::Sender<StreamingEvent>,
+    events: Vec<StreamingEvent>,
+    cancel: &mut CancelSignal,
+) -> AsyncDelivery {
+    for event in events {
+        tokio::select! {
+            biased;
+            _ = cancel.requested() => return AsyncDelivery::Cancelled,
+            result = events_tx.send(event) => {
+                if result.is_err() {
+                    return AsyncDelivery::ReceiverClosed;
+                }
+            }
+        }
+    }
+    AsyncDelivery::Delivered
+}
+
+async fn emit_streaming_events_until(
+    events_tx: &mpsc::Sender<StreamingEvent>,
+    events: Vec<StreamingEvent>,
+    cancel: &mut CancelSignal,
+    deadline: tokio::time::Instant,
+) -> AsyncDelivery {
+    for event in events {
+        let deadline_timer = tokio::time::sleep_until(deadline);
+        tokio::pin!(deadline_timer);
+        tokio::select! {
+            biased;
+            _ = cancel.requested() => return AsyncDelivery::Cancelled,
+            _ = &mut deadline_timer => return AsyncDelivery::DeadlineElapsed,
+            result = events_tx.send(event) => {
+                if result.is_err() {
+                    return AsyncDelivery::ReceiverClosed;
+                }
+            }
+        }
+    }
+    AsyncDelivery::Delivered
+}
+
+fn websocket_error(context: &str, error: WebSocketError, api_key: &str) -> TranscribeError {
+    TranscribeError::NetworkError(format!(
+        "ElevenLabs realtime {context}: {}",
+        redact_and_bound(&error.to_string(), api_key)
+    ))
+}
+
+fn session_start_timeout_error() -> TranscribeError {
+    TranscribeError::NetworkError(
+        "ElevenLabs realtime session did not start within 10 seconds".to_string(),
+    )
+}
+
+type RealtimeSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+enum ConnectActivity {
+    Connected(Result<Box<RealtimeSocket>, WebSocketError>),
+    Audio(Option<Vec<f32>>),
+}
+
+enum SessionActivity {
+    Incoming(Option<Result<Message, WebSocketError>>),
+    Audio(Option<Vec<f32>>),
+}
+
+enum FinalizationActivity {
+    Incoming(Option<Result<Message, WebSocketError>>),
+    Sent(Result<(), WebSocketError>),
+}
+
+enum DrainActivity {
+    Incoming(Option<Result<Message, WebSocketError>>),
+    QuietElapsed,
+}
+
+async fn run_streaming_session(
+    request: Request<()>,
+    api_key: &str,
+    type_partials: bool,
+    mut samples_rx: mpsc::Receiver<Vec<f32>>,
+    events_tx: &mpsc::Sender<StreamingEvent>,
+    cancel_rx: oneshot::Receiver<()>,
+) -> SessionExit {
+    let mut lifecycle = RealtimeLifecycle::new();
+    let mut cancel = CancelSignal::new(cancel_rx);
+    let mut pre_session = PreSessionAudioBuffer::default();
+    let mut samples_closed = false;
+    let start_deadline = tokio::time::Instant::now() + SESSION_START_TIMEOUT;
+    let start_timer = tokio::time::sleep_until(start_deadline);
+    tokio::pin!(start_timer);
+    let connect = tokio_tungstenite::connect_async(request);
+    tokio::pin!(connect);
+
+    let websocket = loop {
+        let activity = tokio::select! {
+            biased;
+            _ = cancel.requested() => return cancelled_exit(&lifecycle),
+            _ = &mut start_timer => {
+                return fatal_exit(&lifecycle, session_start_timeout_error());
+            }
+            activity = async {
+                tokio::select! {
+                    result = &mut connect => {
+                        ConnectActivity::Connected(
+                            result.map(|(socket, _response)| Box::new(socket)),
+                        )
+                    }
+                    chunk = samples_rx.recv(), if !samples_closed => {
+                        ConnectActivity::Audio(chunk)
+                    }
+                }
+            } => activity,
+        };
+
+        match activity {
+            ConnectActivity::Connected(Ok(websocket)) => break websocket,
+            ConnectActivity::Connected(Err(error)) => {
+                let error = websocket_error("connection failed", error, api_key);
+                return fatal_exit(&lifecycle, error);
+            }
+            ConnectActivity::Audio(Some(chunk)) => {
+                if let Err(error) = pre_session.push(chunk) {
+                    return fatal_exit(&lifecycle, error);
+                }
+            }
+            ConnectActivity::Audio(None) => samples_closed = true,
+        }
+    };
+
+    lifecycle.connected();
+    let (mut write, mut read) = websocket.split();
+    let exit = run_connected_session(
+        &mut write,
+        &mut read,
+        api_key,
+        type_partials,
+        &mut samples_rx,
+        events_tx,
+        &mut cancel,
+        pre_session,
+        samples_closed,
+        start_deadline,
+        &mut lifecycle,
+    )
+    .await;
+
+    if should_attempt_close(&exit) {
+        let _ =
+            tokio::time::timeout(WEBSOCKET_CLOSE_TIMEOUT, write.send(Message::Close(None))).await;
+    }
+    exit
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the session loop owns one instance of each lifecycle resource"
+)]
+async fn run_connected_session<S, R>(
+    write: &mut S,
+    read: &mut R,
+    api_key: &str,
+    type_partials: bool,
+    samples_rx: &mut mpsc::Receiver<Vec<f32>>,
+    events_tx: &mpsc::Sender<StreamingEvent>,
+    cancel: &mut CancelSignal,
+    mut pre_session: PreSessionAudioBuffer,
+    mut samples_closed: bool,
+    start_deadline: tokio::time::Instant,
+    lifecycle: &mut RealtimeLifecycle,
+) -> SessionExit
+where
+    S: Sink<Message, Error = WebSocketError> + Unpin,
+    R: futures_util::Stream<Item = Result<Message, WebSocketError>> + Unpin,
+{
+    loop {
+        let start_timer = tokio::time::sleep_until(start_deadline);
+        tokio::pin!(start_timer);
+        let activity = tokio::select! {
+            biased;
+            _ = cancel.requested() => return cancelled_exit(lifecycle),
+            _ = &mut start_timer => {
+                return fatal_exit(lifecycle, session_start_timeout_error());
+            }
+            activity = async {
+                tokio::select! {
+                    incoming = read.next() => SessionActivity::Incoming(incoming),
+                    chunk = samples_rx.recv(), if !samples_closed => {
+                        SessionActivity::Audio(chunk)
+                    }
+                }
+            } => activity,
+        };
+
+        match activity {
+            SessionActivity::Audio(Some(chunk)) => {
+                if let Err(error) = pre_session.push(chunk) {
+                    return fatal_exit(lifecycle, error);
+                }
+            }
+            SessionActivity::Audio(None) => samples_closed = true,
+            SessionActivity::Incoming(incoming) => {
+                let message = match incoming {
+                    Some(Ok(message)) => message,
+                    Some(Err(error)) => {
+                        let error = websocket_error("receive failed", error, api_key);
+                        return fatal_exit(lifecycle, error);
+                    }
+                    None => return close_exit(lifecycle),
+                };
+
+                match message {
+                    Message::Text(payload) => {
+                        let parsed = match parse_wire_message(payload.as_ref(), api_key) {
+                            Ok(parsed) => parsed,
+                            Err(error) => return fatal_exit(lifecycle, error),
+                        };
+                        match parsed {
+                            WireMessage::SessionStarted { .. } => {
+                                lifecycle.session_started();
+                                break;
+                            }
+                            WireMessage::ProviderError { kind, message } => {
+                                let error = TranscribeError::InferenceFailed(format!(
+                                    "ElevenLabs realtime {kind}: {message}"
+                                ));
+                                return fatal_exit(lifecycle, error);
+                            }
+                            WireMessage::Unknown => {}
+                            _ => {
+                                let error = TranscribeError::InferenceFailed(
+                                    "ElevenLabs realtime transcript arrived before session_started"
+                                        .to_string(),
+                                );
+                                return fatal_exit(lifecycle, error);
+                            }
+                        }
+                    }
+                    Message::Ping(payload) => {
+                        match send_websocket_messages_until(
+                            write,
+                            vec![Message::Pong(payload)],
+                            cancel,
+                            api_key,
+                            start_deadline,
+                        )
+                        .await
+                        {
+                            Ok(AsyncDelivery::Delivered) => {}
+                            Ok(AsyncDelivery::Cancelled) => return cancelled_exit(lifecycle),
+                            Ok(AsyncDelivery::DeadlineElapsed) => {
+                                return fatal_exit(lifecycle, session_start_timeout_error());
+                            }
+                            Ok(AsyncDelivery::ReceiverClosed) => unreachable!(),
+                            Err(error) => return fatal_exit(lifecycle, error),
+                        }
+                    }
+                    Message::Close(_) => return close_exit(lifecycle),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let mut encoder = RealtimeAudioEncoder::default();
+    for chunk in pre_session.into_chunks() {
+        let messages = match encoder.push(&chunk) {
+            Ok(messages) => messages,
+            Err(error) => return fatal_exit(lifecycle, error),
+        };
+        match send_audio_messages(write, messages, cancel, api_key).await {
+            Ok(AsyncDelivery::Delivered) => {}
+            Ok(AsyncDelivery::Cancelled) => return cancelled_exit(lifecycle),
+            Ok(AsyncDelivery::ReceiverClosed | AsyncDelivery::DeadlineElapsed) => unreachable!(),
+            Err(error) => return fatal_exit(lifecycle, error),
+        }
+    }
+
+    let mut reconciler = TranscriptReconciler::new(type_partials);
+    if !samples_closed {
+        loop {
+            let activity = tokio::select! {
+                biased;
+                _ = cancel.requested() => return cancelled_exit(lifecycle),
+                activity = async {
+                    tokio::select! {
+                        incoming = read.next() => SessionActivity::Incoming(incoming),
+                        chunk = samples_rx.recv() => SessionActivity::Audio(chunk),
+                    }
+                } => activity,
+            };
+
+            match activity {
+                SessionActivity::Audio(Some(chunk)) => {
+                    let messages = match encoder.push(&chunk) {
+                        Ok(messages) => messages,
+                        Err(error) => return fatal_exit(lifecycle, error),
+                    };
+                    match send_audio_messages(write, messages, cancel, api_key).await {
+                        Ok(AsyncDelivery::Delivered) => {}
+                        Ok(AsyncDelivery::Cancelled) => return cancelled_exit(lifecycle),
+                        Ok(AsyncDelivery::ReceiverClosed | AsyncDelivery::DeadlineElapsed) => {
+                            unreachable!()
+                        }
+                        Err(error) => return fatal_exit(lifecycle, error),
+                    }
+                }
+                SessionActivity::Audio(None) => {
+                    samples_closed = true;
+                    break;
+                }
+                SessionActivity::Incoming(incoming) => {
+                    let message = match incoming {
+                        Some(Ok(message)) => message,
+                        Some(Err(error)) => {
+                            let error = websocket_error("receive failed", error, api_key);
+                            return fatal_exit(lifecycle, error);
+                        }
+                        None => return close_exit(lifecycle),
+                    };
+
+                    match message {
+                        Message::Text(payload) => {
+                            let processed = match process_incoming_text(
+                                payload.as_ref(),
+                                api_key,
+                                &mut reconciler,
+                            ) {
+                                Ok(processed) => processed,
+                                Err(error) => return fatal_exit(lifecycle, error),
+                            };
+                            match emit_streaming_events(events_tx, processed.events, cancel).await {
+                                AsyncDelivery::Delivered => {}
+                                AsyncDelivery::Cancelled => return cancelled_exit(lifecycle),
+                                AsyncDelivery::ReceiverClosed => return SessionExit::Clean,
+                                AsyncDelivery::DeadlineElapsed => unreachable!(),
+                            }
+                        }
+                        Message::Ping(payload) => {
+                            match send_websocket_messages(
+                                write,
+                                vec![Message::Pong(payload)],
+                                cancel,
+                                api_key,
+                            )
+                            .await
+                            {
+                                Ok(AsyncDelivery::Delivered) => {}
+                                Ok(AsyncDelivery::Cancelled) => return cancelled_exit(lifecycle),
+                                Ok(
+                                    AsyncDelivery::ReceiverClosed | AsyncDelivery::DeadlineElapsed,
+                                ) => unreachable!(),
+                                Err(error) => return fatal_exit(lifecycle, error),
+                            }
+                        }
+                        Message::Close(_) => return close_exit(lifecycle),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    debug_assert!(samples_closed);
+    lifecycle.begin_finalization();
+    let drain_deadline = tokio::time::Instant::now() + FINAL_DRAIN_TIMEOUT;
+    let mut messages = match encoder.finish() {
+        Ok(messages) => messages,
+        Err(error) => return fatal_exit(lifecycle, error),
+    };
+    let Some(final_commit) = messages.pop() else {
+        return fatal_exit(
+            lifecycle,
+            TranscribeError::InferenceFailed(
+                "ElevenLabs realtime encoder omitted the final commit".to_string(),
+            ),
+        );
+    };
+    for tail in messages {
+        if let Err(exit) = send_finalization_message(
+            write,
+            read,
+            tail,
+            api_key,
+            &mut reconciler,
+            events_tx,
+            cancel,
+            drain_deadline,
+            lifecycle,
+        )
+        .await
+        {
+            return exit;
+        }
+    }
+    if let Err(exit) = send_explicit_commit(
+        write,
+        read,
+        final_commit,
+        api_key,
+        &mut reconciler,
+        events_tx,
+        cancel,
+        drain_deadline,
+        lifecycle,
+    )
+    .await
+    {
+        return exit;
+    }
+    let mut quiet_deadline = None;
+    loop {
+        let current_quiet_deadline = quiet_deadline;
+        let quiet_timer = async move {
+            match current_quiet_deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => pending().await,
+            }
+        };
+        tokio::pin!(quiet_timer);
+        let hard_timer = tokio::time::sleep_until(drain_deadline);
+        tokio::pin!(hard_timer);
+
+        let activity = tokio::select! {
+            biased;
+            _ = cancel.requested() => return cancelled_exit(lifecycle),
+            _ = &mut hard_timer => {
+                return drain_timer_exit(lifecycle, SessionSignal::DrainDeadlineElapsed)
+                    .expect("final drain deadline always terminates");
+            }
+            activity = async {
+                tokio::select! {
+                    biased;
+                    incoming = read.next() => DrainActivity::Incoming(incoming),
+                    _ = &mut quiet_timer => DrainActivity::QuietElapsed,
+                }
+            } => activity,
+        };
+
+        match activity {
+            DrainActivity::QuietElapsed => {
+                if let Some(exit) = drain_timer_exit(lifecycle, SessionSignal::QuietPeriodElapsed) {
+                    return exit;
+                }
+            }
+            DrainActivity::Incoming(incoming) => {
+                let message = match incoming {
+                    Some(Ok(message)) => message,
+                    Some(Err(error)) => {
+                        let error = websocket_error("receive failed", error, api_key);
+                        return fatal_exit(lifecycle, error);
+                    }
+                    None => return close_exit(lifecycle),
+                };
+
+                match message {
+                    Message::Text(payload) => {
+                        let processed =
+                            match process_incoming_text(payload.as_ref(), api_key, &mut reconciler)
+                            {
+                                Ok(processed) => processed,
+                                Err(error) => return fatal_exit(lifecycle, error),
+                            };
+                        if processed.committed && lifecycle.note_committed() {
+                            quiet_deadline =
+                                Some(tokio::time::Instant::now() + POST_FINAL_QUIET_PERIOD);
+                        }
+                        match emit_streaming_events_until(
+                            events_tx,
+                            processed.events,
+                            cancel,
+                            drain_deadline,
+                        )
+                        .await
+                        {
+                            AsyncDelivery::Delivered => {}
+                            AsyncDelivery::Cancelled => return cancelled_exit(lifecycle),
+                            AsyncDelivery::ReceiverClosed => return SessionExit::Clean,
+                            AsyncDelivery::DeadlineElapsed => {
+                                return drain_timer_exit(
+                                    lifecycle,
+                                    SessionSignal::DrainDeadlineElapsed,
+                                )
+                                .expect("final drain deadline always terminates");
+                            }
+                        }
+                    }
+                    Message::Ping(payload) => {
+                        match send_websocket_messages_until(
+                            write,
+                            vec![Message::Pong(payload)],
+                            cancel,
+                            api_key,
+                            drain_deadline,
+                        )
+                        .await
+                        {
+                            Ok(AsyncDelivery::Delivered) => {}
+                            Ok(AsyncDelivery::Cancelled) => return cancelled_exit(lifecycle),
+                            Ok(AsyncDelivery::DeadlineElapsed) => {
+                                return drain_timer_exit(
+                                    lifecycle,
+                                    SessionSignal::DrainDeadlineElapsed,
+                                )
+                                .expect("final drain deadline always terminates");
+                            }
+                            Ok(AsyncDelivery::ReceiverClosed) => unreachable!(),
+                            Err(error) => return fatal_exit(lifecycle, error),
+                        }
+                    }
+                    Message::Close(_) => return close_exit(lifecycle),
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "finalization must keep the read and write halves under one deadline"
+)]
+async fn send_finalization_message<S, R>(
+    write: &mut S,
+    read: &mut R,
+    message: String,
+    api_key: &str,
+    reconciler: &mut TranscriptReconciler,
+    events_tx: &mpsc::Sender<StreamingEvent>,
+    cancel: &mut CancelSignal,
+    deadline: tokio::time::Instant,
+    lifecycle: &mut RealtimeLifecycle,
+) -> Result<(), SessionExit>
+where
+    S: Sink<Message, Error = WebSocketError> + Unpin,
+    R: futures_util::Stream<Item = Result<Message, WebSocketError>> + Unpin,
+{
+    let send = write.send(Message::Text(message));
+    tokio::pin!(send);
+
+    loop {
+        let deadline_timer = tokio::time::sleep_until(deadline);
+        tokio::pin!(deadline_timer);
+        let activity = tokio::select! {
+            biased;
+            _ = cancel.requested() => return Err(cancelled_exit(lifecycle)),
+            _ = &mut deadline_timer => {
+                return Err(
+                    drain_timer_exit(lifecycle, SessionSignal::DrainDeadlineElapsed)
+                        .expect("finalization deadline always terminates"),
+                );
+            }
+            activity = async {
+                tokio::select! {
+                    incoming = read.next() => FinalizationActivity::Incoming(incoming),
+                    result = &mut send => FinalizationActivity::Sent(result),
+                }
+            } => activity,
+        };
+
+        match activity {
+            FinalizationActivity::Sent(Ok(())) => return Ok(()),
+            FinalizationActivity::Sent(Err(error)) => {
+                return Err(fatal_exit(
+                    lifecycle,
+                    websocket_error("send failed", error, api_key),
+                ));
+            }
+            FinalizationActivity::Incoming(incoming) => {
+                handle_finalization_incoming(
+                    incoming, api_key, reconciler, events_tx, cancel, deadline, lifecycle, false,
+                    &mut None,
+                )
+                .await?;
+            }
+        }
+    }
+}
+
+async fn await_finalization_write<F>(
+    operation: F,
+    api_key: &str,
+    cancel: &mut CancelSignal,
+    deadline: tokio::time::Instant,
+    lifecycle: &RealtimeLifecycle,
+) -> Result<(), SessionExit>
+where
+    F: Future<Output = Result<(), WebSocketError>>,
+{
+    tokio::pin!(operation);
+    let deadline_timer = tokio::time::sleep_until(deadline);
+    tokio::pin!(deadline_timer);
+    tokio::select! {
+        biased;
+        _ = cancel.requested() => Err(cancelled_exit(lifecycle)),
+        _ = &mut deadline_timer => {
+            Err(
+                drain_timer_exit(lifecycle, SessionSignal::DrainDeadlineElapsed)
+                    .expect("finalization deadline always terminates"),
+            )
+        }
+        result = &mut operation => {
+            result.map_err(|error| {
+                fatal_exit(
+                    lifecycle,
+                    websocket_error("send failed", error, api_key),
+                )
+            })
+        }
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the commit boundary must share lifecycle, I/O, and deadline state"
+)]
+async fn send_explicit_commit<S, R>(
+    write: &mut S,
+    read: &mut R,
+    message: String,
+    api_key: &str,
+    reconciler: &mut TranscriptReconciler,
+    events_tx: &mpsc::Sender<StreamingEvent>,
+    cancel: &mut CancelSignal,
+    deadline: tokio::time::Instant,
+    lifecycle: &mut RealtimeLifecycle,
+) -> Result<(), SessionExit>
+where
+    S: Sink<Message, Error = WebSocketError> + Unpin,
+    R: futures_util::Stream<Item = Result<Message, WebSocketError>> + Unpin,
+{
+    // Drain a bounded ready backlog before starting the explicit commit.
+    // A Ping read here may queue an automatic Pong in tungstenite.
+    for _ in 0..MAX_PRE_COMMIT_DRAIN_MESSAGES {
+        let Some(incoming) = read.next().now_or_never() else {
+            break;
+        };
+        handle_finalization_incoming(
+            incoming, api_key, reconciler, events_tx, cancel, deadline, lifecycle, false, &mut None,
+        )
+        .await?;
+    }
+
+    // Flush any automatic control frame queued by the pre-commit drain.
+    await_finalization_write(write.flush(), api_key, cancel, deadline, lifecycle).await?;
+
+    // Do not poll inbound messages while feeding or flushing the commit. Any
+    // response remains queued until the lifecycle is armed below. The
+    // protocol has no request or segment ID, so successful flush is the
+    // strongest observable boundary for "received after explicit commit".
+    await_finalization_write(
+        write.feed(Message::Text(message)),
+        api_key,
+        cancel,
+        deadline,
+        lifecycle,
+    )
+    .await?;
+    await_finalization_write(write.flush(), api_key, cancel, deadline, lifecycle).await?;
+
+    lifecycle.explicit_commit_sent();
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "incoming finalization events share lifecycle and deadline state"
+)]
+async fn handle_finalization_incoming(
+    incoming: Option<Result<Message, WebSocketError>>,
+    api_key: &str,
+    reconciler: &mut TranscriptReconciler,
+    events_tx: &mpsc::Sender<StreamingEvent>,
+    cancel: &mut CancelSignal,
+    deadline: tokio::time::Instant,
+    lifecycle: &mut RealtimeLifecycle,
+    qualifies_as_final: bool,
+    quiet_deadline: &mut Option<tokio::time::Instant>,
+) -> Result<(), SessionExit> {
+    let message = match incoming {
+        Some(Ok(message)) => message,
+        Some(Err(error)) => {
+            return Err(fatal_exit(
+                lifecycle,
+                websocket_error("receive failed", error, api_key),
+            ));
+        }
+        None => return Err(close_exit(lifecycle)),
+    };
+
+    match message {
+        Message::Text(payload) => {
+            let processed = process_incoming_text(payload.as_ref(), api_key, reconciler)
+                .map_err(|error| fatal_exit(lifecycle, error))?;
+            if qualifies_as_final && processed.committed && lifecycle.note_committed() {
+                *quiet_deadline = Some(tokio::time::Instant::now() + POST_FINAL_QUIET_PERIOD);
+            }
+            match emit_streaming_events_until(events_tx, processed.events, cancel, deadline).await {
+                AsyncDelivery::Delivered => {}
+                AsyncDelivery::Cancelled => return Err(cancelled_exit(lifecycle)),
+                AsyncDelivery::ReceiverClosed => return Err(SessionExit::Clean),
+                AsyncDelivery::DeadlineElapsed => {
+                    return Err(
+                        drain_timer_exit(lifecycle, SessionSignal::DrainDeadlineElapsed)
+                            .expect("finalization deadline always terminates"),
+                    );
+                }
+            }
+        }
+        // tungstenite queues the matching Pong while reading. The pinned
+        // feed/send/flush future writes it without duplicating protocol data.
+        Message::Ping(_) => {}
+        Message::Close(_) => return Err(close_exit(lifecycle)),
+        _ => {}
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{
+        collections::BTreeMap,
+        pin::Pin,
+        sync::{Arc, Mutex},
+        task::{Context, Poll},
+    };
 
     use super::*;
 
     const API_KEY: &str = "elevenlabs-secret-key";
+
+    #[derive(Default)]
+    struct CommitOrderState {
+        actions: Vec<&'static str>,
+        control_pending: bool,
+        control_flushed_by_ready: bool,
+        commit_pending: bool,
+        response_ready: bool,
+    }
+
+    struct CommitOrderSink {
+        state: Arc<Mutex<CommitOrderState>>,
+    }
+
+    impl Sink<Message> for CommitOrderSink {
+        type Error = WebSocketError;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            let mut state = self.state.lock().unwrap();
+            if state.control_pending {
+                state.actions.push("control_flush_during_feed");
+                state.control_pending = false;
+                state.control_flushed_by_ready = true;
+            }
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
+            let Message::Text(payload) = item else {
+                panic!("expected explicit commit text frame");
+            };
+            let payload: serde_json::Value = serde_json::from_str(payload.as_ref()).unwrap();
+            assert_eq!(payload["commit"], true);
+
+            let mut state = self.state.lock().unwrap();
+            state.actions.push("commit_feed");
+            state.commit_pending = true;
+            if state.control_flushed_by_ready {
+                state.response_ready = true;
+            }
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            let mut state = self.state.lock().unwrap();
+            if state.control_pending {
+                state.actions.push("control_flush");
+                state.control_pending = false;
+            }
+            if state.commit_pending {
+                state.actions.push("commit_flush");
+                state.commit_pending = false;
+                state.response_ready = true;
+            }
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     #[derive(Debug, PartialEq, Eq)]
     enum EventView {
@@ -673,6 +1904,7 @@ mod tests {
         Final(String, SegmentId),
         Replace(usize, String, SegmentId),
         Error(String),
+        Ended,
     }
 
     fn event_views(events: Vec<StreamingEvent>) -> Vec<EventView> {
@@ -689,7 +1921,7 @@ mod tests {
                     segment_id,
                 } => EventView::Replace(backspace, text, segment_id),
                 StreamingEvent::Error(error) => EventView::Error(error.to_string()),
-                StreamingEvent::Ended => panic!("reconciler does not emit Ended"),
+                StreamingEvent::Ended => EventView::Ended,
             })
             .collect()
     }
@@ -1155,21 +2387,22 @@ mod tests {
     }
 
     #[test]
-    fn turns_redacted_provider_errors_into_streaming_errors() {
-        let parsed = parse_wire_message(
+    fn production_incoming_path_turns_redacted_provider_errors_fatal() {
+        let mut reconciler = TranscriptReconciler::new(false);
+        let error = process_incoming_text(
             r#"{"message_type":"auth_error","error":"bad elevenlabs-secret-key"}"#,
             API_KEY,
+            &mut reconciler,
         )
-        .unwrap();
-        let mut reconciler = TranscriptReconciler::new(false);
-        let events = process_all(&mut reconciler, [parsed]);
+        .unwrap_err()
+        .to_string();
 
         assert_eq!(
-            events,
-            vec![EventView::Error(
-                "Transcription failed: ElevenLabs realtime auth_error: bad [REDACTED]".to_string()
-            )]
+            error,
+            "Transcription failed: ElevenLabs realtime auth_error: bad [REDACTED]"
         );
+        assert!(!error.contains(API_KEY));
+        assert_eq!(reconciler.segment_id, 0);
     }
 
     fn batch_config(region: ElevenLabsRegion) -> ElevenLabsConfig {
@@ -1363,5 +2596,385 @@ mod tests {
         assert!(surfaced.contains("[REDACTED]"));
         assert!(surfaced.ends_with("..."));
         assert!(surfaced.chars().count() <= MAX_PROVIDER_ERROR_CHARS + 100);
+    }
+
+    #[test]
+    fn preserves_pre_session_audio_order_and_rejects_overflow() {
+        let mut ordered = PreSessionAudioBuffer::default();
+        ordered.push(vec![1.0, 2.0]).unwrap();
+        ordered.push(Vec::new()).unwrap();
+        ordered.push(vec![3.0]).unwrap();
+        ordered.push(vec![4.0, 5.0]).unwrap();
+
+        let flattened: Vec<f32> = ordered.into_chunks().into_iter().flatten().collect();
+        assert_eq!(flattened, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+
+        let mut bounded = PreSessionAudioBuffer::default();
+        bounded
+            .push(vec![0.0; PRE_SESSION_AUDIO_LIMIT_SAMPLES - 1])
+            .unwrap();
+        bounded.push(vec![0.0]).unwrap();
+        let error = bounded.push(vec![0.0]).unwrap_err().to_string();
+
+        assert!(error.contains("10-second pre-session audio buffer"));
+        assert_eq!(bounded.sample_count, PRE_SESSION_AUDIO_LIMIT_SAMPLES);
+        assert_eq!(
+            bounded.chunks.iter().map(Vec::len).sum::<usize>(),
+            PRE_SESSION_AUDIO_LIMIT_SAMPLES
+        );
+    }
+
+    #[test]
+    fn encodes_ordered_frames_short_tail_and_exactly_one_final_commit() {
+        let samples: Vec<f32> = (0..SAMPLES_PER_FRAME + 3)
+            .map(|index| (index as f32 % 19.0 - 9.0) / 9.0)
+            .collect();
+        let expected_pcm = f32_to_pcm16le(&samples);
+        let mut encoder = RealtimeAudioEncoder::default();
+        let mut messages = encoder.push(&samples[..701]).unwrap();
+        messages.extend(encoder.push(&samples[701..]).unwrap());
+        messages.extend(encoder.finish().unwrap());
+        messages.extend(encoder.finish().unwrap());
+
+        let decoded: Vec<(Vec<u8>, bool)> = messages
+            .iter()
+            .map(|message| {
+                let value: serde_json::Value = serde_json::from_str(message).unwrap();
+                let audio = base64::engine::general_purpose::STANDARD
+                    .decode(value["audio_base_64"].as_str().unwrap())
+                    .unwrap();
+                (audio, value["commit"].as_bool().unwrap())
+            })
+            .collect();
+
+        assert_eq!(
+            decoded
+                .iter()
+                .map(|(audio, commit)| (audio.len(), *commit))
+                .collect::<Vec<_>>(),
+            vec![(BYTES_PER_FRAME, false), (6, false), (0, true)]
+        );
+        assert_eq!(
+            decoded
+                .iter()
+                .filter(|(_, commit)| !commit)
+                .flat_map(|(audio, _)| audio.iter().copied())
+                .collect::<Vec<_>>(),
+            expected_pcm
+        );
+        assert_eq!(decoded.iter().filter(|(_, commit)| *commit).count(), 1);
+        assert!(encoder
+            .push(&[0.0])
+            .unwrap_err()
+            .to_string()
+            .contains("after the final commit"));
+    }
+
+    #[test]
+    fn parses_and_reconciles_complete_documented_event_sequence() {
+        let fixtures = [
+            r#"{"message_type":"session_started","session_id":"session-123","config":{"sample_rate":16000}}"#,
+            r#"{"message_type":"partial_transcript","text":"hel"}"#,
+            r#"{"message_type":"partial_transcript","text":"hello"}"#,
+            r#"{"message_type":"committed_transcript","text":"hello world"}"#,
+            r#"{"message_type":"committed_transcript_with_timestamps","text":"hello world","language_code":"en","words":[]}"#,
+            r#"{"message_type":"partial_transcript","text":"naïf"}"#,
+            r#"{"message_type":"committed_transcript","text":"naïve"}"#,
+        ];
+        let mut reconciler = TranscriptReconciler::new(true);
+        let mut events = Vec::new();
+        let mut committed_flags = Vec::new();
+
+        for fixture in fixtures {
+            let processed = process_incoming_text(fixture, API_KEY, &mut reconciler).unwrap();
+            committed_flags.push(processed.committed);
+            events.extend(processed.events);
+        }
+
+        assert_eq!(
+            event_views(events),
+            vec![
+                EventView::Partial("hel".to_string(), 0),
+                EventView::Partial("lo".to_string(), 0),
+                EventView::Final(" world".to_string(), 0),
+                EventView::Partial("naïf".to_string(), 1),
+                EventView::Replace(1, "ve".to_string(), 1),
+            ]
+        );
+        assert_eq!(
+            committed_flags,
+            vec![false, false, false, true, false, false, true]
+        );
+    }
+
+    fn lifecycle_phases() -> Vec<RealtimeLifecycle> {
+        let connecting = RealtimeLifecycle::new();
+        let mut awaiting = RealtimeLifecycle::new();
+        awaiting.connected();
+        let mut streaming = RealtimeLifecycle::new();
+        streaming.connected();
+        streaming.session_started();
+        let mut finalizing = RealtimeLifecycle::new();
+        finalizing.connected();
+        finalizing.session_started();
+        finalizing.begin_finalization();
+        let mut awaiting_final = RealtimeLifecycle::new();
+        awaiting_final.connected();
+        awaiting_final.session_started();
+        awaiting_final.begin_finalization();
+        awaiting_final.explicit_commit_sent();
+        let mut final_received = RealtimeLifecycle::new();
+        final_received.connected();
+        final_received.session_started();
+        final_received.begin_finalization();
+        final_received.explicit_commit_sent();
+        assert!(final_received.note_committed());
+
+        vec![
+            connecting,
+            awaiting,
+            streaming,
+            finalizing,
+            awaiting_final,
+            final_received,
+        ]
+    }
+
+    #[test]
+    fn cancellation_is_clean_and_provider_errors_are_fatal_in_every_phase() {
+        for lifecycle in lifecycle_phases() {
+            assert_eq!(
+                lifecycle.decide(SessionSignal::Cancelled),
+                SessionDecision::EndCleanly
+            );
+            assert_eq!(
+                lifecycle.decide(SessionSignal::FatalError),
+                SessionDecision::Fail(SessionFailure::FatalError)
+            );
+        }
+    }
+
+    #[test]
+    fn socket_close_requires_a_post_commit_final_response() {
+        let phases = lifecycle_phases();
+        for lifecycle in &phases[..5] {
+            assert_eq!(
+                lifecycle.decide(SessionSignal::SocketClosed),
+                SessionDecision::Fail(SessionFailure::SocketClosedBeforeFinal)
+            );
+        }
+        assert_eq!(
+            phases[5].decide(SessionSignal::SocketClosed),
+            SessionDecision::EndCleanly
+        );
+    }
+
+    #[test]
+    fn final_drain_distinguishes_pre_commit_and_post_commit_transcripts() {
+        let mut lifecycle = RealtimeLifecycle::new();
+        lifecycle.connected();
+        lifecycle.session_started();
+        lifecycle.begin_finalization();
+
+        assert!(!lifecycle.note_committed());
+        assert_eq!(
+            lifecycle.decide(SessionSignal::DrainDeadlineElapsed),
+            SessionDecision::Fail(SessionFailure::FinalResponseTimeout)
+        );
+
+        lifecycle.explicit_commit_sent();
+        assert!(lifecycle.note_committed());
+        assert_eq!(
+            lifecycle.decide(SessionSignal::QuietPeriodElapsed),
+            SessionDecision::EndCleanly
+        );
+        assert_eq!(
+            lifecycle.decide(SessionSignal::DrainDeadlineElapsed),
+            SessionDecision::EndCleanly
+        );
+    }
+
+    #[tokio::test]
+    async fn ping_control_output_precedes_commit_and_final_qualification() {
+        let state = Arc::new(Mutex::new(CommitOrderState::default()));
+        let read_state = Arc::clone(&state);
+        let mut ping_sent = false;
+        let mut response_sent = false;
+        let mut read = futures_util::stream::poll_fn(move |_cx| {
+            let mut state = read_state.lock().unwrap();
+            if !ping_sent {
+                ping_sent = true;
+                state.actions.push("ping_read");
+                state.control_pending = true;
+                return Poll::Ready(Some(Ok(Message::Ping(Vec::new()))));
+            }
+            if state.response_ready && !response_sent {
+                response_sent = true;
+                state.actions.push("response_read");
+                return Poll::Ready(Some(Ok(Message::Text(
+                    r#"{"message_type":"committed_transcript","text":"done"}"#.to_string(),
+                ))));
+            }
+            Poll::Pending
+        });
+        let mut write = CommitOrderSink {
+            state: Arc::clone(&state),
+        };
+        let (events_tx, mut events_rx) = mpsc::channel(4);
+        let (_cancel_tx, cancel_rx) = oneshot::channel();
+        let mut cancel = CancelSignal::new(cancel_rx);
+        let mut lifecycle = RealtimeLifecycle::new();
+        lifecycle.connected();
+        lifecycle.session_started();
+        lifecycle.begin_finalization();
+        let mut reconciler = TranscriptReconciler::new(false);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+
+        send_explicit_commit(
+            &mut write,
+            &mut read,
+            serialize_final_commit().unwrap(),
+            API_KEY,
+            &mut reconciler,
+            &events_tx,
+            &mut cancel,
+            deadline,
+            &mut lifecycle,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(lifecycle.phase, SessionPhase::DrainingAwaitingFinal);
+        assert_eq!(
+            state.lock().unwrap().actions,
+            vec!["ping_read", "control_flush", "commit_feed", "commit_flush"]
+        );
+
+        let incoming = tokio::time::timeout(Duration::from_millis(50), read.next())
+            .await
+            .unwrap();
+        let mut quiet_deadline = None;
+        handle_finalization_incoming(
+            incoming,
+            API_KEY,
+            &mut reconciler,
+            &events_tx,
+            &mut cancel,
+            deadline,
+            &mut lifecycle,
+            true,
+            &mut quiet_deadline,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(lifecycle.phase, SessionPhase::DrainingQuiet);
+        assert!(quiet_deadline.is_some());
+        assert!(matches!(
+            events_rx.recv().await,
+            Some(StreamingEvent::Final { text, .. }) if text == "done"
+        ));
+        assert_eq!(
+            state.lock().unwrap().actions,
+            vec![
+                "ping_read",
+                "control_flush",
+                "commit_feed",
+                "commit_flush",
+                "response_read",
+            ]
+        );
+    }
+
+    #[test]
+    fn only_clean_completion_attempts_a_bounded_websocket_close() {
+        let fatal = SessionExit::Fatal(TranscribeError::InferenceFailed("boom".to_string()));
+        assert!(should_attempt_close(&SessionExit::Clean));
+        assert!(!should_attempt_close(&SessionExit::Cancelled));
+        assert!(!should_attempt_close(&fatal));
+        assert_eq!(WEBSOCKET_CLOSE_TIMEOUT, Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn reserved_epilogue_stays_ordered_when_normal_capacity_is_full() {
+        let (events_tx, mut events_rx) = mpsc::channel(4);
+        let epilogue = StreamEpilogue::reserve(&events_tx).unwrap();
+        events_tx
+            .try_send(StreamingEvent::Partial {
+                text: "one".to_string(),
+                segment_id: 0,
+            })
+            .unwrap();
+        events_tx
+            .try_send(StreamingEvent::Partial {
+                text: "two".to_string(),
+                segment_id: 0,
+            })
+            .unwrap();
+        assert!(events_tx
+            .try_send(StreamingEvent::Final {
+                text: "full".to_string(),
+                segment_id: 0,
+            })
+            .is_err());
+
+        epilogue.finish(SessionExit::Fatal(TranscribeError::InferenceFailed(
+            "boom".to_string(),
+        )));
+
+        let events = vec![
+            events_rx.recv().await.unwrap(),
+            events_rx.recv().await.unwrap(),
+            events_rx.recv().await.unwrap(),
+            events_rx.recv().await.unwrap(),
+        ];
+        assert_eq!(
+            event_views(events),
+            vec![
+                EventView::Partial("one".to_string(), 0),
+                EventView::Partial("two".to_string(), 0),
+                EventView::Error("Transcription failed: boom".to_string()),
+                EventView::Ended,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_epilogue_emits_only_ended_at_saturated_capacity() {
+        let (events_tx, mut events_rx) = mpsc::channel(2);
+        let epilogue = StreamEpilogue::reserve(&events_tx).unwrap();
+
+        epilogue.finish(SessionExit::Cancelled);
+
+        assert!(matches!(
+            events_rx.recv().await,
+            Some(StreamingEvent::Ended)
+        ));
+        assert!(events_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn final_event_delivery_cannot_outlive_hard_deadline() {
+        let (events_tx, _events_rx) = mpsc::channel(1);
+        events_tx
+            .try_send(StreamingEvent::Partial {
+                text: "full".to_string(),
+                segment_id: 0,
+            })
+            .unwrap();
+        let (_cancel_tx, cancel_rx) = oneshot::channel();
+        let mut cancel = CancelSignal::new(cancel_rx);
+        let delivery = emit_streaming_events_until(
+            &events_tx,
+            vec![StreamingEvent::Final {
+                text: "blocked".to_string(),
+                segment_id: 0,
+            }],
+            &mut cancel,
+            tokio::time::Instant::now() + Duration::from_millis(10),
+        )
+        .await;
+
+        assert_eq!(delivery, AsyncDelivery::DeadlineElapsed);
     }
 }
