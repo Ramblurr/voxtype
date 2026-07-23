@@ -9,14 +9,17 @@
     reason = "protocol primitives are wired into transports in the following implementation tasks"
 )]
 
-use base64::Engine as _;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use tokio_tungstenite::tungstenite::{
-    client::IntoClientRequest,
-    http::{header::HeaderName, HeaderValue, Request},
-};
+use std::{sync::OnceLock, time::Duration};
 
-use super::{SegmentId, StreamingEvent};
+use base64::Engine as _;
+use reqwest::{
+    header::{HeaderName, HeaderValue},
+    StatusCode,
+};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use tokio_tungstenite::tungstenite::{client::IntoClientRequest, http::Request};
+
+use super::{SegmentId, StreamingEvent, Transcriber};
 use crate::{
     config::{ElevenLabsConfig, ElevenLabsRegion},
     error::TranscribeError,
@@ -24,6 +27,10 @@ use crate::{
 
 const REALTIME_MODEL: &str = "scribe_v2_realtime";
 const REALTIME_AUDIO_FORMAT: &str = "pcm_16000";
+const BATCH_MODEL: &str = "scribe_v2";
+const BATCH_FILE_FORMAT: &str = "pcm_s16le_16";
+const BATCH_FILE_NAME: &str = "voxtype.pcm";
+const BATCH_FILE_MIME: &str = "application/octet-stream";
 const SAMPLE_RATE: u32 = 16_000;
 const COMMIT_STRATEGY: &str = "vad";
 const VAD_SILENCE_THRESHOLD_SECS: &str = "1.5";
@@ -33,10 +40,12 @@ const MIN_SILENCE_DURATION_MS: &str = "100";
 const FRAME_DURATION_MS: usize = 100;
 const SAMPLES_PER_FRAME: usize = SAMPLE_RATE as usize * FRAME_DURATION_MS / 1_000;
 const BYTES_PER_FRAME: usize = SAMPLES_PER_FRAME * size_of::<i16>();
+const MIN_BATCH_SAMPLES: usize = SAMPLE_RATE as usize / 10;
+const BATCH_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_PROVIDER_ERROR_CHARS: usize = 512;
 const API_KEY_HEADER: HeaderName = HeaderName::from_static("xi-api-key");
 
-fn realtime_origin(region: ElevenLabsRegion) -> &'static str {
+fn api_origin(region: ElevenLabsRegion) -> &'static str {
     match region {
         ElevenLabsRegion::Global => "api.elevenlabs.io",
         ElevenLabsRegion::Us => "api.us.elevenlabs.io",
@@ -49,7 +58,7 @@ fn realtime_origin(region: ElevenLabsRegion) -> &'static str {
 fn realtime_url(config: &ElevenLabsConfig) -> Result<reqwest::Url, TranscribeError> {
     let endpoint = format!(
         "wss://{}/v1/speech-to-text/realtime",
-        realtime_origin(config.region)
+        api_origin(config.region)
     );
     let mut url = reqwest::Url::parse(&endpoint).map_err(|error| {
         TranscribeError::ConfigError(format!("Invalid ElevenLabs realtime endpoint: {error}"))
@@ -98,6 +107,294 @@ fn realtime_request(
         .headers_mut()
         .insert(API_KEY_HEADER, sensitive_api_key_header(api_key)?);
     Ok(request)
+}
+
+pub struct ElevenLabsTranscriber {
+    config: ElevenLabsConfig,
+    api_key: String,
+    batch_client: OnceLock<reqwest::Client>,
+}
+
+impl ElevenLabsTranscriber {
+    pub fn new(config: &ElevenLabsConfig) -> Result<Self, TranscribeError> {
+        let api_key = config.api_key.clone().ok_or_else(|| {
+            TranscribeError::ConfigError(
+                "ElevenLabs API key required: set [elevenlabs] api_key or ELEVENLABS_API_KEY"
+                    .to_string(),
+            )
+        })?;
+        sensitive_api_key_header(&api_key)?;
+
+        let mut config = config.clone();
+        config.api_key = None;
+
+        Ok(Self {
+            config,
+            api_key,
+            batch_client: OnceLock::new(),
+        })
+    }
+
+    fn batch_client(&self) -> Result<&reqwest::Client, TranscribeError> {
+        if let Some(client) = self.batch_client.get() {
+            return Ok(client);
+        }
+
+        let client = build_batch_client()?;
+        let _ = self.batch_client.set(client);
+        Ok(self
+            .batch_client
+            .get()
+            .expect("ElevenLabs batch client was just initialized"))
+    }
+
+    async fn batch_transcribe(&self, samples: &[f32]) -> Result<String, TranscribeError> {
+        validate_batch_input(samples)?;
+
+        let client = self.batch_client()?;
+        let upload = BatchUpload::new(samples, self.config.language_code.clone());
+        let request = build_batch_request(client, &self.config, &self.api_key, upload)?;
+        let response = client.execute(request).await.map_err(|error| {
+            TranscribeError::NetworkError(format!(
+                "ElevenLabs batch request failed: {}",
+                redact_and_bound(&error.to_string(), &self.api_key)
+            ))
+        })?;
+        let status = response.status();
+        let body = response.text().await.map_err(|error| {
+            TranscribeError::NetworkError(format!(
+                "Could not read ElevenLabs batch response: {}",
+                redact_and_bound(&error.to_string(), &self.api_key)
+            ))
+        })?;
+
+        if !status.is_success() {
+            return Err(map_batch_status(status, &body, &self.api_key));
+        }
+
+        parse_batch_response(&body)
+    }
+}
+
+impl Transcriber for ElevenLabsTranscriber {
+    /// Run one synchronous batch transcription against ElevenLabs Scribe.
+    ///
+    /// Calls made inside Tokio must use a multi-thread runtime because the
+    /// bridge uses `block_in_place`. Calls without an ambient runtime use a
+    /// private current-thread runtime.
+    fn transcribe(&self, samples: &[f32]) -> Result<String, TranscribeError> {
+        validate_batch_input(samples)?;
+
+        let run = self.batch_transcribe(samples);
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(run)),
+            Err(_) => {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| {
+                        TranscribeError::InferenceFailed(format!(
+                            "Could not create ElevenLabs batch runtime: {error}"
+                        ))
+                    })?;
+                runtime.block_on(run)
+            }
+        }
+    }
+}
+
+fn validate_batch_input(samples: &[f32]) -> Result<(), TranscribeError> {
+    if samples.is_empty() {
+        return Err(TranscribeError::AudioFormat(
+            "Empty audio buffer".to_string(),
+        ));
+    }
+    if samples.len() < MIN_BATCH_SAMPLES {
+        return Err(TranscribeError::AudioFormat(format!(
+            "ElevenLabs batch transcription requires at least 100 ms of audio ({MIN_BATCH_SAMPLES} samples)"
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct BatchUpload {
+    pcm16le: Vec<u8>,
+    language_code: Option<String>,
+    model_id: &'static str,
+    file_format: &'static str,
+    tag_audio_events: bool,
+    diarize: bool,
+    webhook: bool,
+}
+
+impl BatchUpload {
+    fn new(samples: &[f32], language_code: Option<String>) -> Self {
+        Self {
+            pcm16le: f32_to_pcm16le(samples),
+            language_code,
+            model_id: BATCH_MODEL,
+            file_format: BATCH_FILE_FORMAT,
+            tag_audio_events: false,
+            diarize: false,
+            webhook: false,
+        }
+    }
+
+    fn into_multipart(self) -> Result<reqwest::multipart::Form, TranscribeError> {
+        let file = reqwest::multipart::Part::bytes(self.pcm16le)
+            .file_name(BATCH_FILE_NAME)
+            .mime_str(BATCH_FILE_MIME)
+            .map_err(|error| {
+                TranscribeError::InferenceFailed(format!(
+                    "Could not construct ElevenLabs PCM upload: {error}"
+                ))
+            })?;
+
+        let mut form = reqwest::multipart::Form::new()
+            .part("file", file)
+            .text("file_format", self.file_format)
+            .text("model_id", self.model_id);
+        if let Some(language_code) = self.language_code {
+            form = form.text("language_code", language_code);
+        }
+
+        Ok(form
+            .text("tag_audio_events", self.tag_audio_events.to_string())
+            .text("diarize", self.diarize.to_string())
+            .text("webhook", self.webhook.to_string()))
+    }
+}
+
+fn build_batch_client() -> Result<reqwest::Client, TranscribeError> {
+    reqwest::Client::builder()
+        // The custom xi-api-key header is not covered by reqwest's
+        // cross-origin redirect sanitizer. Never forward it away from the
+        // fixed regional production endpoint.
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(BATCH_REQUEST_TIMEOUT)
+        .build()
+        .map_err(|error| {
+            TranscribeError::InferenceFailed(format!(
+                "Could not initialize ElevenLabs HTTP client: {error}"
+            ))
+        })
+}
+
+fn batch_url(config: &ElevenLabsConfig) -> Result<reqwest::Url, TranscribeError> {
+    let endpoint = format!("https://{}/v1/speech-to-text", api_origin(config.region));
+    reqwest::Url::parse(&endpoint).map_err(|error| {
+        TranscribeError::ConfigError(format!("Invalid ElevenLabs batch endpoint: {error}"))
+    })
+}
+
+fn build_batch_request(
+    client: &reqwest::Client,
+    config: &ElevenLabsConfig,
+    api_key: &str,
+    upload: BatchUpload,
+) -> Result<reqwest::Request, TranscribeError> {
+    client
+        .post(batch_url(config)?)
+        .header(API_KEY_HEADER, sensitive_api_key_header(api_key)?)
+        .multipart(upload.into_multipart()?)
+        .build()
+        .map_err(|error| {
+            TranscribeError::InferenceFailed(format!(
+                "Could not construct ElevenLabs batch request: {error}"
+            ))
+        })
+}
+
+fn parse_batch_response(body: &str) -> Result<String, TranscribeError> {
+    let response: serde_json::Value = serde_json::from_str(body).map_err(|error| {
+        TranscribeError::InferenceFailed(format!(
+            "Could not parse ElevenLabs batch response: {error}"
+        ))
+    })?;
+
+    response
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            TranscribeError::InferenceFailed("ElevenLabs batch response missing text".to_string())
+        })
+}
+
+struct BatchErrorInfo {
+    provider_status: Option<String>,
+    message: String,
+}
+
+fn batch_error_info(body: &str) -> BatchErrorInfo {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return BatchErrorInfo {
+            provider_status: None,
+            message: body.to_string(),
+        };
+    };
+
+    let provider_status = value
+        .pointer("/detail/status")
+        .or_else(|| value.get("status"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let message = value
+        .pointer("/detail/message")
+        .or_else(|| value.get("message"))
+        .or_else(|| value.get("error"))
+        .or_else(|| value.get("detail"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(body)
+        .to_string();
+
+    BatchErrorInfo {
+        provider_status,
+        message,
+    }
+}
+
+fn map_batch_status(status: StatusCode, body: &str, api_key: &str) -> TranscribeError {
+    let error_info = batch_error_info(body);
+    let provider_status = error_info.provider_status.as_deref();
+    let message_hint = error_info.message.to_ascii_lowercase();
+    let unaccepted_terms = provider_status == Some("unaccepted_terms")
+        || message_hint.contains("terms of service")
+        || message_hint.contains("terms have not been accepted")
+        || message_hint.contains("accept the terms");
+    let authentication_failure = status == StatusCode::UNAUTHORIZED
+        || matches!(
+            provider_status,
+            Some("auth_error" | "invalid_api_key" | "authentication_error")
+        )
+        || (status == StatusCode::FORBIDDEN
+            && (message_hint.contains("api key")
+                || message_hint.contains("api-key")
+                || message_hint.contains("authentication")));
+
+    let message = if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+        && unaccepted_terms
+    {
+        "ElevenLabs Scribe terms have not been accepted: accept them in the ElevenLabs dashboard"
+            .to_string()
+    } else if authentication_failure {
+        "ElevenLabs authentication failed: check [elevenlabs] api_key or ELEVENLABS_API_KEY"
+            .to_string()
+    } else if status == StatusCode::FORBIDDEN {
+        "ElevenLabs access denied: check API key permissions and Scribe access".to_string()
+    } else if status == StatusCode::TOO_MANY_REQUESTS {
+        "ElevenLabs rate limit exceeded: wait and try again".to_string()
+    } else {
+        let detail = redact_and_bound(error_info.message.trim(), api_key);
+        if detail.is_empty() {
+            format!("ElevenLabs batch request failed (HTTP {status})")
+        } else {
+            format!("ElevenLabs batch request failed (HTTP {status}): {detail}")
+        }
+    };
+
+    TranscribeError::InferenceFailed(message)
 }
 
 fn f32_to_pcm16(sample: f32) -> i16 {
@@ -873,5 +1170,198 @@ mod tests {
                 "Transcription failed: ElevenLabs realtime auth_error: bad [REDACTED]".to_string()
             )]
         );
+    }
+
+    fn batch_config(region: ElevenLabsRegion) -> ElevenLabsConfig {
+        ElevenLabsConfig {
+            api_key: Some(API_KEY.to_string()),
+            region,
+            language_code: Some("en".to_string()),
+            streaming: false,
+            type_partials: false,
+        }
+    }
+
+    fn batch_transcriber() -> ElevenLabsTranscriber {
+        ElevenLabsTranscriber::new(&batch_config(ElevenLabsRegion::Global))
+            .expect("valid test transcriber")
+    }
+
+    #[test]
+    fn rejects_empty_and_short_batch_input_before_requesting() {
+        let transcriber = batch_transcriber();
+
+        let empty_error = transcriber.transcribe(&[]).unwrap_err().to_string();
+        assert!(empty_error.contains("Empty audio buffer"));
+
+        let short_error = transcriber
+            .transcribe(&vec![0.0; MIN_BATCH_SAMPLES - 1])
+            .unwrap_err()
+            .to_string();
+        assert!(short_error.contains("at least 100 ms"));
+        assert!(short_error.contains("1600 samples"));
+        assert!(transcriber.batch_client.get().is_none());
+    }
+
+    #[test]
+    fn builds_pcm_batch_upload_with_fixed_fields() {
+        let samples = [-2.0, -0.5, 0.0, 0.5, 2.0];
+        let expected_pcm: Vec<u8> = [-32767i16, -16384, 0, 16384, 32767]
+            .into_iter()
+            .flat_map(i16::to_le_bytes)
+            .collect();
+
+        assert_eq!(
+            BatchUpload::new(&samples, Some("en".to_string())),
+            BatchUpload {
+                pcm16le: expected_pcm,
+                language_code: Some("en".to_string()),
+                model_id: "scribe_v2",
+                file_format: "pcm_s16le_16",
+                tag_audio_events: false,
+                diarize: false,
+                webhook: false,
+            }
+        );
+    }
+
+    #[test]
+    fn builds_sensitive_regional_batch_requests() {
+        let cases = [
+            (ElevenLabsRegion::Global, "api.elevenlabs.io"),
+            (ElevenLabsRegion::Us, "api.us.elevenlabs.io"),
+            (ElevenLabsRegion::Eu, "api.eu.residency.elevenlabs.io"),
+            (ElevenLabsRegion::India, "api.in.residency.elevenlabs.io"),
+            (
+                ElevenLabsRegion::Singapore,
+                "api.sg.residency.elevenlabs.io",
+            ),
+        ];
+        let client = build_batch_client().unwrap();
+
+        for (region, expected_host) in cases {
+            let config = batch_config(region);
+            let upload = BatchUpload::new(&[0.0; MIN_BATCH_SAMPLES], config.language_code.clone());
+            let request = build_batch_request(&client, &config, API_KEY, upload).unwrap();
+            let uri = request.url().as_str();
+
+            assert_eq!(request.method(), reqwest::Method::POST);
+            assert_eq!(request.url().scheme(), "https");
+            assert_eq!(request.url().host_str(), Some(expected_host));
+            assert_eq!(request.url().path(), "/v1/speech-to-text");
+            assert!(request.url().query().is_none());
+            assert!(!uri.contains(API_KEY));
+            let header = request.headers().get(&API_KEY_HEADER).unwrap();
+            assert_eq!(header, API_KEY);
+            assert!(header.is_sensitive());
+            assert!(request
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("multipart/form-data; boundary="));
+        }
+    }
+
+    #[test]
+    fn lazily_builds_and_reuses_batch_client() {
+        let transcriber = batch_transcriber();
+        assert!(transcriber.batch_client.get().is_none());
+
+        let first = transcriber.batch_client().unwrap() as *const reqwest::Client;
+        let second = transcriber.batch_client().unwrap() as *const reqwest::Client;
+
+        assert_eq!(first, second);
+        assert!(transcriber.batch_client.get().is_some());
+        assert_eq!(BATCH_REQUEST_TIMEOUT, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn parses_documented_batch_response() {
+        let fixture = r#"{
+            "language_code": "en",
+            "language_probability": 0.98,
+            "text": "Hello world!",
+            "words": [{
+                "end": 0.5,
+                "logprob": -0.124,
+                "speaker_id": "speaker_1",
+                "start": 0,
+                "text": "Hello",
+                "type": "word"
+            }]
+        }"#;
+
+        assert_eq!(parse_batch_response(fixture).unwrap(), "Hello world!");
+    }
+
+    #[test]
+    fn rejects_malformed_or_textless_batch_responses() {
+        let malformed = parse_batch_response(r#"{"text":"unfinished""#)
+            .unwrap_err()
+            .to_string();
+        let missing = parse_batch_response(r#"{"language_code":"en","words":[]}"#)
+            .unwrap_err()
+            .to_string();
+
+        assert!(malformed.contains("Could not parse ElevenLabs batch response"));
+        assert!(missing.contains("missing text"));
+        assert!(!malformed.contains("unfinished"));
+    }
+
+    #[test]
+    fn maps_batch_http_statuses_to_remediation() {
+        let cases = [
+            (
+                StatusCode::UNAUTHORIZED,
+                r#"{"detail":{"status":"invalid_api_key","message":"Invalid xi-api-key"}}"#,
+                "Transcription failed: ElevenLabs authentication failed: check [elevenlabs] api_key or ELEVENLABS_API_KEY",
+            ),
+            (
+                StatusCode::FORBIDDEN,
+                r#"{"detail":{"status":"unaccepted_terms","message":"Forbidden"}}"#,
+                "Transcription failed: ElevenLabs Scribe terms have not been accepted: accept them in the ElevenLabs dashboard",
+            ),
+            (
+                StatusCode::FORBIDDEN,
+                r#"{"detail":{"status":"forbidden","message":"API key terminated"}}"#,
+                "Transcription failed: ElevenLabs authentication failed: check [elevenlabs] api_key or ELEVENLABS_API_KEY",
+            ),
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                r#"{"detail":{"status":"rate_limited","message":"Too many requests"}}"#,
+                "Transcription failed: ElevenLabs rate limit exceeded: wait and try again",
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                r#"{"detail":{"status":"server_error","message":"temporary provider failure"}}"#,
+                "Transcription failed: ElevenLabs batch request failed (HTTP 500 Internal Server Error): temporary provider failure",
+            ),
+        ];
+
+        for (status, body, expected) in cases {
+            assert_eq!(
+                map_batch_status(status, body, API_KEY).to_string(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn redacts_and_bounds_api_key_in_batch_provider_errors() {
+        let body = serde_json::json!({
+            "detail": {
+                "status": "server_error",
+                "message": format!("failed for {API_KEY}: {}", "x".repeat(600)),
+            }
+        })
+        .to_string();
+        let surfaced = map_batch_status(StatusCode::BAD_GATEWAY, &body, API_KEY).to_string();
+
+        assert!(!surfaced.contains(API_KEY));
+        assert!(surfaced.contains("[REDACTED]"));
+        assert!(surfaced.ends_with("..."));
+        assert!(surfaced.chars().count() <= MAX_PROVIDER_ERROR_CHARS + 100);
     }
 }
