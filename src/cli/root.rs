@@ -188,6 +188,71 @@ pub struct Cli {
     )]
     pub soniox_api_key: Option<String>,
 
+    // -- ElevenLabs --
+    /// API key for ElevenLabs (or use ELEVENLABS_API_KEY env var)
+    #[arg(
+        long,
+        value_name = "KEY",
+        help_heading = "ElevenLabs",
+        hide_short_help = true
+    )]
+    pub elevenlabs_api_key: Option<String>,
+
+    /// ElevenLabs API region
+    #[arg(
+        long,
+        value_name = "REGION",
+        value_parser = ["global", "us", "eu", "india", "singapore"],
+        help_heading = "ElevenLabs",
+        hide_short_help = true
+    )]
+    pub elevenlabs_region: Option<String>,
+
+    /// Language hint for ElevenLabs (ISO 639-1 or ISO 639-3)
+    #[arg(
+        long,
+        value_name = "LANG",
+        help_heading = "ElevenLabs",
+        hide_short_help = true
+    )]
+    pub elevenlabs_language: Option<String>,
+
+    /// Use ElevenLabs realtime transcription for dictation
+    #[arg(
+        long,
+        help_heading = "ElevenLabs",
+        hide_short_help = true,
+        conflicts_with = "no_elevenlabs_streaming"
+    )]
+    pub elevenlabs_streaming: bool,
+
+    /// Use ElevenLabs batch transcription for dictation
+    #[arg(
+        long,
+        help_heading = "ElevenLabs",
+        hide_short_help = true,
+        conflicts_with = "elevenlabs_streaming"
+    )]
+    pub no_elevenlabs_streaming: bool,
+
+    /// Type stable ElevenLabs partial transcript extensions before commit
+    #[arg(
+        long,
+        help_heading = "ElevenLabs",
+        hide_short_help = true,
+        conflicts_with = "no_elevenlabs_type_partials"
+    )]
+    pub elevenlabs_type_partials: bool,
+
+    /// Type only committed ElevenLabs transcript segments
+    #[arg(
+        long,
+        help_heading = "ElevenLabs",
+        hide_short_help = true,
+        conflicts_with = "elevenlabs_type_partials"
+    )]
+    pub no_elevenlabs_type_partials: bool,
+
     // -- Hotkey --
     /// Override hotkey (e.g., SCROLLLOCK, PAUSE, F13, MEDIA, WEV_234, EVTEST_226)
     #[arg(long, value_name = "KEY", help_heading = "Hotkey")]

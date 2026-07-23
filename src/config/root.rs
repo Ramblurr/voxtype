@@ -1,7 +1,8 @@
 use super::{
-    AudioConfig, CohereConfig, DolphinConfig, HotkeyConfig, MeetingConfig, MoonshineConfig,
-    OmnilingualConfig, OutputConfig, ParaformerConfig, ParakeetConfig, Profile, SenseVoiceConfig,
-    SonioxConfig, StatusConfig, TextConfig, TranscriptionEngine, VadConfig, WhisperConfig,
+    AudioConfig, CohereConfig, DolphinConfig, ElevenLabsConfig, HotkeyConfig, MeetingConfig,
+    MoonshineConfig, OmnilingualConfig, OutputConfig, ParaformerConfig, ParakeetConfig, Profile,
+    SenseVoiceConfig, SonioxConfig, StatusConfig, TextConfig, TranscriptionEngine, VadConfig,
+    WhisperConfig,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -61,6 +62,11 @@ pub struct Config {
     #[serde(default)]
     pub soniox: Option<SonioxConfig>,
 
+    /// ElevenLabs Scribe cloud transcription configuration
+    /// (optional, only used when engine = "elevenlabs")
+    #[serde(default)]
+    pub elevenlabs: Option<ElevenLabsConfig>,
+
     /// Text processing configuration (replacements, spoken punctuation)
     #[serde(default)]
     pub text: TextConfig,
@@ -113,6 +119,7 @@ impl Default for Config {
             omnilingual: None,
             cohere: None,
             soniox: None,
+            elevenlabs: None,
             text: TextConfig::default(),
             vad: VadConfig::default(),
             status: StatusConfig::default(),
@@ -145,6 +152,11 @@ impl Config {
                 .soniox
                 .as_ref()
                 .map(|s| s.streaming && !s.async_api)
+                .unwrap_or(false),
+            TranscriptionEngine::ElevenLabs => self
+                .elevenlabs
+                .as_ref()
+                .map(|e| e.streaming)
                 .unwrap_or(false),
             _ => false,
         }
@@ -338,8 +350,8 @@ impl Config {
                 .as_ref()
                 .map(|c| c.on_demand_loading)
                 .unwrap_or(false),
-            // Soniox is a cloud backend; nothing to load on demand.
-            TranscriptionEngine::Soniox => false,
+            // Cloud backends have no local model to load on demand.
+            TranscriptionEngine::Soniox | TranscriptionEngine::ElevenLabs => false,
         }
     }
 
@@ -387,6 +399,8 @@ impl Config {
                 .as_ref()
                 .map(|s| s.model.as_str())
                 .unwrap_or("soniox (not configured)"),
+            // Protocol model IDs remain private to the provider adapter.
+            TranscriptionEngine::ElevenLabs => "elevenlabs",
         }
     }
 
@@ -458,6 +472,7 @@ mod tests {
         assert_eq!(config.whisper.model, "base.en");
         assert_eq!(config.output.mode, OutputMode::Type);
         assert!(!config.output.auto_submit);
+        assert!(config.elevenlabs.is_none());
     }
 
     #[test]
@@ -504,5 +519,41 @@ mod tests {
             Some(v) => std::env::set_var("HOME", v),
             None => std::env::remove_var("HOME"),
         }
+    }
+
+    #[test]
+    fn elevenlabs_streaming_active_follows_explicit_config() {
+        let mut config = Config {
+            engine: TranscriptionEngine::ElevenLabs,
+            ..Config::default()
+        };
+        assert!(!config.streaming_active());
+
+        config.elevenlabs = Some(ElevenLabsConfig::default());
+        assert!(config.streaming_active());
+
+        config.elevenlabs.as_mut().unwrap().streaming = false;
+        assert!(!config.streaming_active());
+    }
+
+    #[test]
+    fn elevenlabs_has_no_on_demand_model_loading() {
+        let config = Config {
+            engine: TranscriptionEngine::ElevenLabs,
+            elevenlabs: Some(ElevenLabsConfig::default()),
+            ..Config::default()
+        };
+        assert!(!config.on_demand_loading());
+    }
+
+    #[test]
+    fn elevenlabs_uses_provider_name_for_model_logging() {
+        let config = Config {
+            engine: TranscriptionEngine::ElevenLabs,
+            elevenlabs: Some(ElevenLabsConfig::default()),
+            ..Config::default()
+        };
+        assert_eq!(config.model_name(), "elevenlabs");
+    }
     }
 }

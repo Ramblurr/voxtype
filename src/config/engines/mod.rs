@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 mod cohere;
 mod dolphin;
+mod elevenlabs;
 mod moonshine;
 mod omnilingual;
 mod paraformer;
@@ -13,6 +14,7 @@ mod soniox;
 
 pub use cohere::CohereConfig;
 pub use dolphin::DolphinConfig;
+pub use elevenlabs::{ElevenLabsConfig, ElevenLabsRegion};
 pub use moonshine::MoonshineConfig;
 pub use omnilingual::OmnilingualConfig;
 pub use paraformer::ParaformerConfig;
@@ -66,6 +68,9 @@ pub enum TranscriptionEngine {
     /// Use Soniox (cloud streaming WebSocket STT).
     /// Requires: cargo build --features soniox
     Soniox,
+    /// Use ElevenLabs Scribe (cloud batch and realtime STT).
+    /// Requires: cargo build --features elevenlabs
+    ElevenLabs,
 }
 
 impl TranscriptionEngine {
@@ -184,5 +189,14 @@ mod tests {
 
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.engine, TranscriptionEngine::Whisper);
+    }
+
+    #[test]
+    fn parses_elevenlabs_engine_without_provider_section() {
+        let config: Config = toml::from_str("engine = \"elevenlabs\"").unwrap();
+        assert_eq!(
+            (config.engine, config.elevenlabs.is_none()),
+            (TranscriptionEngine::ElevenLabs, true)
+        );
     }
 }

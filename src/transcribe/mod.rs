@@ -283,6 +283,16 @@ pub fn create_transcriber(config: &Config) -> Result<Box<dyn Transcriber>, Trans
             "Soniox engine requested but voxtype was not compiled with --features soniox"
                 .to_string(),
         )),
+        #[cfg(feature = "elevenlabs")]
+        TranscriptionEngine::ElevenLabs => Err(TranscribeError::InitFailed(
+            "ElevenLabs backend scaffolding is compiled, but the provider adapter is not registered"
+                .to_string(),
+        )),
+        #[cfg(not(feature = "elevenlabs"))]
+        TranscriptionEngine::ElevenLabs => Err(TranscribeError::InitFailed(
+            "ElevenLabs engine requested but voxtype was not compiled with --features elevenlabs"
+                .to_string(),
+        )),
     }
 }
 

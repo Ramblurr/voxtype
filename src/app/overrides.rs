@@ -170,6 +170,43 @@ pub(crate) fn apply_cli_overrides(config: &mut config::Config, cli: &Cli) -> Opt
             .api_key = Some(key.clone());
     }
 
+    // ElevenLabs overrides. Any provider-specific CLI flag materializes the
+    // optional section so source builds can be configured without TOML.
+    if cli.elevenlabs_api_key.is_some()
+        || cli.elevenlabs_region.is_some()
+        || cli.elevenlabs_language.is_some()
+        || cli.elevenlabs_streaming
+        || cli.no_elevenlabs_streaming
+        || cli.elevenlabs_type_partials
+        || cli.no_elevenlabs_type_partials
+    {
+        let elevenlabs = config
+            .elevenlabs
+            .get_or_insert_with(config::ElevenLabsConfig::default);
+        if let Some(ref key) = cli.elevenlabs_api_key {
+            elevenlabs.api_key = Some(key.clone());
+        }
+        if let Some(ref region) = cli.elevenlabs_region {
+            // Clap validates this closed set before overrides are applied.
+            elevenlabs.region = region
+                .parse::<config::ElevenLabsRegion>()
+                .expect("validated ElevenLabs region");
+        }
+        if let Some(ref language) = cli.elevenlabs_language {
+            elevenlabs.set_language_code(language);
+        }
+        apply_bool_override(
+            &mut elevenlabs.streaming,
+            cli.elevenlabs_streaming,
+            cli.no_elevenlabs_streaming,
+        );
+        apply_bool_override(
+            &mut elevenlabs.type_partials,
+            cli.elevenlabs_type_partials,
+            cli.no_elevenlabs_type_partials,
+        );
+    }
+
     // Audio overrides
     if let Some(ref device) = cli.audio_device {
         config.audio.device = device.clone();
@@ -316,4 +353,170 @@ pub(crate) fn apply_cli_overrides(config: &mut config::Config, cli: &Cli) -> Opt
     }
 
     top_level_model
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+    use std::ffi::OsString;
+    use std::sync::Mutex;
+
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+    const ELEVENLABS_ENV_VARS: [&str; 5] = [
+        "ELEVENLABS_API_KEY",
+        "VOXTYPE_ELEVENLABS_REGION",
+        "VOXTYPE_ELEVENLABS_LANGUAGE",
+        "VOXTYPE_ELEVENLABS_STREAMING",
+        "VOXTYPE_ELEVENLABS_TYPE_PARTIALS",
+    ];
+
+    struct EnvRestore(Vec<(&'static str, Option<OsString>)>);
+
+    impl EnvRestore {
+        fn set(values: &[(&'static str, Option<&str>)]) -> Self {
+            let originals = ELEVENLABS_ENV_VARS
+                .iter()
+                .map(|name| (*name, std::env::var_os(name)))
+                .collect();
+
+            for name in ELEVENLABS_ENV_VARS {
+                std::env::remove_var(name);
+            }
+            for (name, value) in values {
+                if let Some(value) = value {
+                    std::env::set_var(name, value);
+                }
+            }
+
+            Self(originals)
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (name, value) in self.0.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    fn load_without_config_file() -> config::Config {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.toml");
+        config::load_config(Some(&missing)).unwrap()
+    }
+
+    #[test]
+    fn elevenlabs_environment_materializes_and_layers_all_values() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _env = EnvRestore::set(&[
+            ("ELEVENLABS_API_KEY", Some("env-secret")),
+            ("VOXTYPE_ELEVENLABS_REGION", Some("eu")),
+            ("VOXTYPE_ELEVENLABS_LANGUAGE", Some("  en  ")),
+            ("VOXTYPE_ELEVENLABS_STREAMING", Some("false")),
+            ("VOXTYPE_ELEVENLABS_TYPE_PARTIALS", Some("true")),
+        ]);
+
+        let config = load_without_config_file();
+        let elevenlabs = config.elevenlabs.expect("environment creates section");
+        assert_eq!(
+            (
+                elevenlabs.api_key.as_deref(),
+                elevenlabs.region,
+                elevenlabs.language_code.as_deref(),
+                elevenlabs.streaming,
+                elevenlabs.type_partials,
+            ),
+            (
+                Some("env-secret"),
+                config::ElevenLabsRegion::Eu,
+                Some("en"),
+                false,
+                true,
+            )
+        );
+    }
+
+    #[test]
+    fn elevenlabs_cli_flag_materializes_absent_section() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _env = EnvRestore::set(&[]);
+        let mut config = load_without_config_file();
+        assert!(config.elevenlabs.is_none());
+
+        let cli = Cli::try_parse_from([
+            "voxtype",
+            "--elevenlabs-region",
+            "us",
+            "--no-elevenlabs-streaming",
+            "--elevenlabs-type-partials",
+        ])
+        .unwrap();
+        apply_cli_overrides(&mut config, &cli);
+
+        let elevenlabs = config.elevenlabs.expect("CLI creates section");
+        assert_eq!(
+            (
+                elevenlabs.region,
+                elevenlabs.streaming,
+                elevenlabs.type_partials,
+            ),
+            (config::ElevenLabsRegion::Us, false, true)
+        );
+    }
+
+    #[test]
+    fn elevenlabs_cli_overrides_environment_values() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _env = EnvRestore::set(&[
+            ("ELEVENLABS_API_KEY", Some("env-secret")),
+            ("VOXTYPE_ELEVENLABS_REGION", Some("eu")),
+            ("VOXTYPE_ELEVENLABS_LANGUAGE", Some("fr")),
+            ("VOXTYPE_ELEVENLABS_STREAMING", Some("false")),
+            ("VOXTYPE_ELEVENLABS_TYPE_PARTIALS", Some("true")),
+        ]);
+
+        let mut config = load_without_config_file();
+        let cli = Cli::try_parse_from([
+            "voxtype",
+            "--engine",
+            "elevenlabs",
+            "--elevenlabs-api-key",
+            "cli-secret",
+            "--elevenlabs-region",
+            "singapore",
+            "--elevenlabs-language",
+            "  de  ",
+            "--elevenlabs-streaming",
+            "--no-elevenlabs-type-partials",
+        ])
+        .unwrap();
+
+        apply_cli_overrides(&mut config, &cli);
+
+        let engine = config.engine;
+        let elevenlabs = config.elevenlabs.expect("CLI keeps section materialized");
+        assert_eq!(
+            (
+                engine,
+                elevenlabs.api_key.as_deref(),
+                elevenlabs.region,
+                elevenlabs.language_code.as_deref(),
+                elevenlabs.streaming,
+                elevenlabs.type_partials,
+            ),
+            (
+                config::TranscriptionEngine::ElevenLabs,
+                Some("cli-secret"),
+                config::ElevenLabsRegion::Singapore,
+                Some("de"),
+                true,
+                false,
+            )
+        );
+    }
 }

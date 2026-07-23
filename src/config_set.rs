@@ -33,13 +33,14 @@ pub const ENGINE_NAMES: &[&str] = &[
     "dolphin",
     "omnilingual",
     "cohere",
+    "elevenlabs",
 ];
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigSetError {
     #[error(
         "unknown engine '{0}'. Valid engines: whisper, parakeet, moonshine, \
-         sensevoice, paraformer, dolphin, omnilingual, cohere"
+         sensevoice, paraformer, dolphin, omnilingual, cohere, elevenlabs"
     )]
     UnknownEngine(String),
 
@@ -71,6 +72,7 @@ pub fn parse_engine(name: &str) -> Option<TranscriptionEngine> {
         "dolphin" => Some(TranscriptionEngine::Dolphin),
         "omnilingual" => Some(TranscriptionEngine::Omnilingual),
         "cohere" => Some(TranscriptionEngine::Cohere),
+        "elevenlabs" => Some(TranscriptionEngine::ElevenLabs),
         _ => None,
     }
 }
@@ -94,6 +96,7 @@ pub fn engine_feature_compiled(name: &str) -> bool {
         "dolphin" => cfg!(feature = "dolphin"),
         "omnilingual" => cfg!(feature = "omnilingual"),
         "cohere" => cfg!(feature = "cohere"),
+        "elevenlabs" => cfg!(feature = "elevenlabs"),
         _ => false,
     }
 }
