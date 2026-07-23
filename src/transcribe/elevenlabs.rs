@@ -4,11 +4,6 @@
 //! construction, and transcript reconciliation separate from the transport
 //! lifecycle. The batch and realtime adapters build on these helpers.
 
-#![allow(
-    dead_code,
-    reason = "protocol primitives are wired into transports in the following implementation tasks"
-)]
-
 use std::{
     collections::VecDeque,
     future::{pending, Future},
@@ -221,6 +216,10 @@ impl Transcriber for ElevenLabsTranscriber {
                 runtime.block_on(run)
             }
         }
+    }
+
+    fn as_streaming(&self) -> Option<&dyn StreamingTranscriber> {
+        self.config.streaming.then_some(self as _)
     }
 }
 

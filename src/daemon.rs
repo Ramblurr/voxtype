@@ -192,6 +192,49 @@ enum OutputOverride {
     FileWithPath(PathBuf),
 }
 
+struct EffectiveStreamingOutput {
+    config: crate::config::OutputConfig,
+    profile_post_process: bool,
+}
+
+fn resolve_streaming_output_config(
+    base: &crate::config::OutputConfig,
+    output_override: Option<OutputOverride>,
+    profile: Option<&crate::config::Profile>,
+    auto_submit_override: Option<bool>,
+    shift_enter_override: Option<bool>,
+) -> EffectiveStreamingOutput {
+    let mut config = base.clone();
+
+    let override_mode = match output_override {
+        Some(OutputOverride::Mode(mode)) => Some(mode),
+        Some(OutputOverride::FileWithPath(path)) => {
+            config.file_path = Some(path);
+            Some(OutputMode::File)
+        }
+        None => None,
+    };
+    if let Some(mode) = override_mode {
+        config.mode = mode;
+    } else if let Some(mode) = profile.and_then(|profile| profile.output_mode.clone()) {
+        config.mode = mode;
+    }
+
+    if let Some(auto_submit) = auto_submit_override {
+        config.auto_submit = auto_submit;
+    }
+    if let Some(shift_enter) = shift_enter_override {
+        config.shift_enter_newlines = shift_enter;
+    }
+
+    EffectiveStreamingOutput {
+        config,
+        profile_post_process: profile
+            .and_then(|profile| profile.post_process_command.as_ref())
+            .is_some(),
+    }
+}
+
 /// Read and consume the output mode override file
 /// Format: "type", "clipboard", "paste", "file", or "file:/path/to/file.txt"
 fn read_output_mode_override() -> Option<OutputOverride> {
@@ -343,6 +386,25 @@ fn read_bool_override(name: &str) -> Option<bool> {
 fn cleanup_bool_override(name: &str) {
     let override_file = Config::runtime_dir().join(format!("{}_override", name));
     let _ = std::fs::remove_file(&override_file);
+}
+
+const RECORDING_OVERRIDE_FILES: &[&str] = &[
+    "output_mode_override",
+    "model_override",
+    "profile_override",
+    "auto_submit_override",
+    "shift_enter_override",
+    "smart_auto_submit_override",
+];
+
+fn cleanup_recording_override_files_in(runtime_dir: &std::path::Path) {
+    for name in RECORDING_OVERRIDE_FILES {
+        let _ = std::fs::remove_file(runtime_dir.join(name));
+    }
+}
+
+fn cleanup_recording_override_files() {
+    cleanup_recording_override_files_in(&Config::runtime_dir());
 }
 
 // === Meeting Mode IPC ===
@@ -862,17 +924,43 @@ impl Daemon {
         }
     }
 
+    fn take_elevenlabs_streaming_output_config(
+        &self,
+    ) -> std::result::Result<crate::config::OutputConfig, crate::error::TranscribeError> {
+        let output_override = read_output_mode_override();
+        let profile_name = read_profile_override();
+        let profile = profile_name
+            .as_deref()
+            .and_then(|name| self.config.get_profile(name));
+        if let Some(name) = profile_name.as_deref() {
+            if profile.is_none() {
+                tracing::warn!(
+                    "Profile '{}' not found in config, using default streaming settings",
+                    name
+                );
+            }
+        }
+
+        let effective = resolve_streaming_output_config(
+            &self.config.output,
+            output_override,
+            profile,
+            read_bool_override("auto_submit"),
+            read_bool_override("shift_enter"),
+        );
+        crate::transcribe::validate_elevenlabs_realtime_output(
+            &effective.config,
+            effective.profile_post_process,
+        )?;
+        Ok(effective.config)
+    }
+
     /// Attempt to start a streaming transcription session.
     ///
-    /// Returns `true` and populates the streaming locals on success. Returns
-    /// `false` (and does nothing) when:
-    /// - the preloaded transcriber is `None` (e.g., on_demand_loading without
-    ///   a successful background load yet);
-    /// - the preloaded transcriber's `as_streaming()` returns `None`;
-    /// - audio capture or `start_stream` fail.
-    ///
-    /// On `false`, callers should fall through to the existing batch
-    /// recording path.
+    /// Returns `true` when streaming starts or when an ElevenLabs realtime
+    /// configuration error has been handled. Returns `false` when the caller
+    /// should fall through to the existing batch recording path because the
+    /// transcriber has no streaming surface or generic streaming setup failed.
     #[allow(clippy::too_many_arguments)]
     async fn try_start_streaming(
         &mut self,
@@ -891,28 +979,62 @@ impl Daemon {
             return false;
         }
 
+        let elevenlabs_realtime = matches!(
+            self.config.engine,
+            crate::config::TranscriptionEngine::ElevenLabs
+        );
+        let output_config = if elevenlabs_realtime {
+            match self.take_elevenlabs_streaming_output_config() {
+                Ok(output) => output,
+                Err(error) => {
+                    let message = error.to_string();
+                    tracing::error!("Cannot start ElevenLabs realtime transcription: {message}");
+                    self.play_feedback(SoundEvent::Error);
+                    cleanup_recording_override_files();
+                    send_notification(
+                        "ElevenLabs Realtime Unavailable",
+                        &message,
+                        self.config.output.notification.show_engine_icon,
+                        self.config.engine,
+                        "critical",
+                    )
+                    .await;
+                    return true;
+                }
+            }
+        } else {
+            self.config.output.clone()
+        };
+
         let (capture, samples_rx) = match self.start_streaming_capture().await {
-            Ok(v) => v,
-            Err(()) => return false,
+            Ok(value) => value,
+            Err(()) => {
+                if elevenlabs_realtime {
+                    cleanup_recording_override_files();
+                }
+                return elevenlabs_realtime;
+            }
         };
 
         let streaming = transcriber.as_streaming().expect("checked above");
         let handle = match streaming.start_stream(samples_rx) {
-            Ok(h) => h,
-            Err(e) => {
-                tracing::error!("Failed to start streaming session: {}", e);
+            Ok(handle) => handle,
+            Err(error) => {
+                tracing::error!("Failed to start streaming session: {error}");
                 self.play_feedback(SoundEvent::Error);
-                // Drop the capture cleanly; ignore final samples.
-                let mut c = capture;
-                let _ = c.stop().await;
-                return false;
+                let mut capture = capture;
+                let _ = capture.stop().await;
+                if elevenlabs_realtime {
+                    cleanup_recording_override_files();
+                }
+                return elevenlabs_realtime;
             }
         };
 
         *audio_capture = Some(capture);
         *streaming_handle = Some(handle);
         *streaming_session = Some(StreamingSession::new());
-        *streaming_chain = Some(output::create_output_chain(&self.config.output));
+        *streaming_chain = Some(output::create_output_chain(&output_config));
         *state = State::Streaming {
             started_at: std::time::Instant::now(),
             model_override,
@@ -925,19 +1047,19 @@ impl Daemon {
         self.pause_media_players().await;
         self.duck_media_streams().await;
 
-        if let Some(cmd) = &self.config.output.pre_recording_command {
-            if let Err(e) = output::run_hook(cmd, "pre_recording").await {
-                tracing::warn!("{}", e);
+        if let Some(cmd) = &output_config.pre_recording_command {
+            if let Err(error) = output::run_hook(cmd, "pre_recording").await {
+                tracing::warn!("{error}");
             }
         }
 
-        if self.config.output.notification.on_recording_start {
+        if output_config.notification.on_recording_start {
             send_notification(
                 "Streaming Active",
                 "Listening...",
-                self.config.output.notification.show_engine_icon,
+                output_config.notification.show_engine_icon,
                 self.config.engine,
-                &self.config.output.notification.urgency,
+                &output_config.notification.urgency,
             )
             .await;
         }
@@ -1015,6 +1137,7 @@ impl Daemon {
         self.stop_streaming_drain_pump();
         *streaming_session = None;
         *streaming_chain = None;
+        cleanup_recording_override_files();
 
         self.play_feedback(SoundEvent::TranscriptionComplete);
 
@@ -1059,12 +1182,7 @@ impl Daemon {
         *streaming_session = None;
         *streaming_chain = None;
 
-        cleanup_output_mode_override();
-        cleanup_model_override();
-        cleanup_profile_override();
-        cleanup_bool_override("auto_submit");
-        cleanup_bool_override("shift_enter");
-        cleanup_bool_override("smart_auto_submit");
+        cleanup_recording_override_files();
         self.restore_ducked_media_streams();
         self.resume_media_players();
         *state = State::Idle;
@@ -1626,12 +1744,7 @@ impl Daemon {
     /// Reset state to idle and run post_output_command to reset compositor submap
     /// Call this when exiting from recording/transcribing without normal output flow
     async fn reset_to_idle(&mut self, state: &mut State) {
-        cleanup_output_mode_override();
-        cleanup_model_override();
-        cleanup_profile_override();
-        cleanup_bool_override("auto_submit");
-        cleanup_bool_override("shift_enter");
-        cleanup_bool_override("smart_auto_submit");
+        cleanup_recording_override_files();
         self.resume_media_players();
         *state = State::Idle;
         self.update_state("idle");
@@ -2754,7 +2867,9 @@ impl Daemon {
                                     &mut streaming_chain,
                                     model_override.clone(),
                                 ).await {
-                                    tracing::info!("Streaming session started (push-to-talk)");
+                                    if state.is_streaming() {
+                                        tracing::info!("Streaming session started (push-to-talk)");
+                                    }
                                 } else {
                                     // Create and start audio capture
                                     tracing::debug!("Creating audio capture with device: {}", self.config.audio.device);
@@ -2977,7 +3092,9 @@ impl Daemon {
                                     &mut streaming_chain,
                                     model_override.clone(),
                                 ).await {
-                                    tracing::info!("Streaming session started (toggle)");
+                                    if state.is_streaming() {
+                                        tracing::info!("Streaming session started (toggle)");
+                                    }
                                 } else {
                                     match self.start_recording_capture().await {
                                         Ok(capture) => {
@@ -3472,7 +3589,9 @@ impl Daemon {
                             &mut streaming_chain,
                             model_override.clone(),
                         ).await {
-                            tracing::info!("Streaming session started (SIGUSR1)");
+                            if state.is_streaming() {
+                                tracing::info!("Streaming session started (SIGUSR1)");
+                            }
                         } else {
                             match self.start_recording_capture().await {
                                 Ok(capture) => {
@@ -3982,6 +4101,118 @@ mod tests {
         // We can't easily mock Config::runtime_dir(), so we test the file operations
         // directly using the same logic as the functions under test
         f(runtime_dir)
+    }
+
+    #[test]
+    fn streaming_output_resolution_applies_profile_and_cli_precedence() {
+        let base = crate::config::OutputConfig::default();
+        let profile = crate::config::Profile {
+            post_process_command: Some("clean-transcript".to_string()),
+            output_mode: Some(OutputMode::Clipboard),
+            ..crate::config::Profile::default()
+        };
+
+        let from_profile = resolve_streaming_output_config(&base, None, Some(&profile), None, None);
+        assert_eq!(from_profile.config.mode, OutputMode::Clipboard);
+        assert!(from_profile.profile_post_process);
+        let error = crate::transcribe::validate_elevenlabs_realtime_output(
+            &from_profile.config,
+            from_profile.profile_post_process,
+        )
+        .expect_err("profile clipboard output must reject realtime")
+        .to_string();
+        assert!(error.contains("output.mode"));
+
+        let from_cli = resolve_streaming_output_config(
+            &base,
+            Some(OutputOverride::Mode(OutputMode::Type)),
+            Some(&profile),
+            None,
+            None,
+        );
+        assert_eq!(from_cli.config.mode, OutputMode::Type);
+        assert!(from_cli.profile_post_process);
+        let error = crate::transcribe::validate_elevenlabs_realtime_output(
+            &from_cli.config,
+            from_cli.profile_post_process,
+        )
+        .expect_err("profile post-processing must reject realtime")
+        .to_string();
+        assert!(error.contains("profile.post_process_command"));
+
+        let from_cli = resolve_streaming_output_config(
+            &base,
+            Some(OutputOverride::Mode(OutputMode::Clipboard)),
+            None,
+            None,
+            None,
+        );
+        let error = crate::transcribe::validate_elevenlabs_realtime_output(
+            &from_cli.config,
+            from_cli.profile_post_process,
+        )
+        .expect_err("per-record clipboard output must reject realtime")
+        .to_string();
+        assert!(error.contains("output.mode"));
+    }
+
+    #[test]
+    fn streaming_output_resolution_applies_boolean_overrides() {
+        let base = crate::config::OutputConfig {
+            auto_submit: true,
+            ..crate::config::OutputConfig::default()
+        };
+
+        let effective = resolve_streaming_output_config(&base, None, None, Some(false), Some(true));
+
+        assert!(!effective.config.auto_submit);
+        assert!(effective.config.shift_enter_newlines);
+        assert!(!effective.profile_post_process);
+        crate::transcribe::validate_elevenlabs_realtime_output(
+            &effective.config,
+            effective.profile_post_process,
+        )
+        .expect("per-record no-auto-submit override makes realtime safe");
+
+        let effective = resolve_streaming_output_config(
+            &crate::config::OutputConfig::default(),
+            None,
+            None,
+            Some(true),
+            None,
+        );
+        let error = crate::transcribe::validate_elevenlabs_realtime_output(
+            &effective.config,
+            effective.profile_post_process,
+        )
+        .expect_err("per-record auto-submit must reject realtime")
+        .to_string();
+        assert!(error.contains("output.auto_submit"));
+    }
+
+    #[test]
+    fn streaming_override_cleanup_removes_every_per_record_sentinel() {
+        with_test_runtime_dir(|dir| {
+            let names = [
+                "output_mode_override",
+                "model_override",
+                "profile_override",
+                "auto_submit_override",
+                "shift_enter_override",
+                "smart_auto_submit_override",
+            ];
+            for name in names {
+                fs::write(dir.join(name), "value").unwrap();
+            }
+
+            cleanup_recording_override_files_in(dir);
+
+            let remaining: Vec<_> = names
+                .into_iter()
+                .filter(|name| dir.join(name).exists())
+                .collect();
+            assert!(remaining.is_empty(), "stale overrides: {remaining:?}");
+        });
     }
 
     #[test]
