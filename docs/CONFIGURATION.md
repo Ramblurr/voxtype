@@ -1474,6 +1474,17 @@ Select one of three dictation modes:
 
 Older `streaming` and `type_partials` fields remain accepted. When `mode` appears with either legacy field, `mode` wins.
 
+All three modes support `[hotkey] mode = "push_to_talk"` when the built-in
+hotkey listener is enabled. It reads the physical release directly from evdev,
+so ElevenLabs realtime output cannot hide the release event. After release,
+Voxtype closes the microphone and waits for ElevenLabs' bounded final commit.
+
+If `[hotkey] enabled = false` and compositor bindings trigger Voxtype, use a
+toggle binding with `realtime` or `partials`. Synthetic typing can disrupt
+held-key tracking in Hyprland, Sway, and River before their release binding
+fires. `batch` mode does not type while the key is held and remains safe with
+compositor-managed push-to-talk.
+
 ### vad_silence_threshold_secs
 
 **Type:** Float
@@ -1503,7 +1514,7 @@ vad_silence_threshold_secs = 0.8
 engine = "elevenlabs"
 
 [hotkey]
-mode = "toggle"
+mode = "push_to_talk"
 
 [elevenlabs]
 language_code = "en"

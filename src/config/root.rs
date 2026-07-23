@@ -133,12 +133,6 @@ impl Default for Config {
 
 impl Config {
     /// Returns true if the active engine is configured for streaming output.
-    ///
-    /// Used to decide whether to auto-promote push-to-talk to toggle activation:
-    /// streaming output types characters at the cursor while the user is still
-    /// holding the hotkey, which clobbers libinput's held-key state tracker on
-    /// Hyprland/Sway/River. New streaming backends plug into this gate without
-    /// editing the daemon.
     pub fn streaming_active(&self) -> bool {
         match self.engine {
             TranscriptionEngine::Parakeet => {
@@ -160,6 +154,16 @@ impl Config {
                 .unwrap_or(false),
             _ => false,
         }
+    }
+
+    /// Returns true when startup must replace push-to-talk with toggle mode.
+    ///
+    /// ElevenLabs can keep push-to-talk when the built-in hotkey listener reads
+    /// raw evdev events. Synthetic output cannot hide the physical release from
+    /// that listener. Compositor-managed release bindings still require toggle.
+    pub fn streaming_requires_toggle_activation(&self) -> bool {
+        self.streaming_active()
+            && !(self.engine == TranscriptionEngine::ElevenLabs && self.hotkey.enabled)
     }
 
     /// Clone this config with engine-specific overrides for meeting (long-form)
@@ -537,6 +541,24 @@ mod tests {
 
         config.elevenlabs.as_mut().unwrap().mode = ElevenLabsMode::Batch;
         assert!(!config.streaming_active());
+    }
+
+    #[test]
+    fn elevenlabs_streaming_ptt_requires_toggle_only_for_external_hotkeys() {
+        let mut config = Config {
+            engine: TranscriptionEngine::ElevenLabs,
+            elevenlabs: Some(ElevenLabsConfig::default()),
+            ..Config::default()
+        };
+
+        assert!(config.streaming_active());
+        assert!(!config.streaming_requires_toggle_activation());
+
+        config.hotkey.enabled = false;
+        assert!(config.streaming_requires_toggle_activation());
+
+        config.elevenlabs.as_mut().unwrap().mode = ElevenLabsMode::Batch;
+        assert!(!config.streaming_requires_toggle_activation());
     }
 
     #[test]

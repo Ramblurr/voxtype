@@ -495,15 +495,19 @@ Build with `--features elevenlabs`, set `ELEVENLABS_API_KEY`, and choose a mode:
 engine = "elevenlabs"
 
 [hotkey]
-mode = "toggle"
+mode = "push_to_talk"
 
 [elevenlabs]
 mode = "partials"
 vad_silence_threshold_secs = 0.8
 ```
 
-Use `mode = "realtime"` for stable committed segments or `mode = "batch"` for one transcript after release. See [CONFIGURATION.md](CONFIGURATION.md#elevenlabs) for every option.
-
+Use `mode = "realtime"` for stable committed segments or `mode = "batch"`
+for one transcript after release. Built-in evdev hotkeys support push-to-talk
+in every mode. If compositor bindings call `voxtype record`, use toggle for
+`realtime` and `partials` so synthetic typing cannot hide the compositor's
+key-release binding. See [CONFIGURATION.md](CONFIGURATION.md#elevenlabs) for
+every option.
 
 ### Creating a Custom Configuration
 

@@ -235,6 +235,14 @@ fn resolve_streaming_output_config(
     }
 }
 
+/// Whether a stopped stream should discard backend flush events.
+///
+/// ElevenLabs has a bounded explicit-commit drain, so keep its output attached
+/// long enough to deliver the final phrase after push-to-talk is released.
+fn should_disown_streaming_output_on_stop(engine: crate::config::TranscriptionEngine) -> bool {
+    !matches!(engine, crate::config::TranscriptionEngine::ElevenLabs)
+}
+
 /// Read and consume the output mode override file
 /// Format: "type", "clipboard", "paste", "file", or "file:/path/to/file.txt"
 fn read_output_mode_override() -> Option<OutputOverride> {
@@ -2467,14 +2475,12 @@ impl Daemon {
         // #450 — the silent v0.6.x to v0.7.0 wrapper-flip incident.
         self.warn_on_variant_mismatch();
 
-        // Streaming dictation types characters at the cursor while the user is
-        // still holding the PTT key. On Wayland compositors backed by libinput
-        // (Hyprland, Sway, River) those synthetic key events clobber the held-
-        // key state tracker, so the physical key release never fires bindrd and
-        // the daemon gets stuck in streaming. Force toggle activation when
-        // streaming is enabled. The user's config file is left untouched; this
-        // override only applies to the running daemon.
-        if self.config.streaming_active()
+        // Compositor-managed streaming PTT can lose its release binding when
+        // synthetic output changes libinput's held-key state. Keep the existing
+        // toggle safeguard for those bindings. ElevenLabs may use PTT with the
+        // built-in raw evdev listener, which receives the physical release
+        // independently of compositor state.
+        if self.config.streaming_requires_toggle_activation()
             && self.config.hotkey.mode == crate::config::ActivationMode::PushToTalk
         {
             tracing::warn!(
@@ -2919,14 +2925,22 @@ impl Daemon {
                         (HotkeyEvent::Released, ActivationMode::PushToTalk) => {
                             tracing::debug!("Received HotkeyEvent::Released (push-to-talk), state.is_recording() = {}", state.is_recording());
                             if state.is_streaming() {
-                                tracing::debug!("Streaming push-to-talk released; closing audio capture and disowning session");
+                                let disown_output =
+                                    should_disown_streaming_output_on_stop(self.config.engine);
+                                if disown_output {
+                                    tracing::debug!("Streaming push-to-talk released; closing audio capture and disowning session");
+                                } else {
+                                    tracing::debug!("Streaming push-to-talk released; closing audio capture and awaiting final commit");
+                                }
                                 self.stop_streaming_capture(&mut audio_capture).await;
-                                // Drop session/chain so the backend's
-                                // post-stop flush emission is dropped at
-                                // the event pump instead of typed.
-                                // Matches the SIGUSR2 stop path.
-                                streaming_session = None;
-                                streaming_chain = None;
+                                if disown_output {
+                                    // Drop session/chain so the backend's
+                                    // post-stop flush emission is dropped at
+                                    // the event pump instead of typed.
+                                    // Matches the SIGUSR2 stop path.
+                                    streaming_session = None;
+                                    streaming_chain = None;
+                                }
                             } else if let State::Recording { model_override, .. } = &state {
                                 let transcriber = match self.get_transcriber_for_recording(
                                     model_override.as_deref(),
@@ -3638,16 +3652,24 @@ impl Daemon {
                 _ = sigusr2.recv() => {
                     tracing::debug!("Received SIGUSR2 (stop recording)");
                     if state.is_streaming() {
-                        tracing::info!("SIGUSR2 stop while streaming; closing capture and disowning session");
+                        let disown_output =
+                            should_disown_streaming_output_on_stop(self.config.engine);
+                        if disown_output {
+                            tracing::info!("SIGUSR2 stop while streaming; closing capture and disowning session");
+                        } else {
+                            tracing::info!("SIGUSR2 stop while streaming; closing capture and awaiting final commit");
+                        }
                         self.stop_streaming_capture(&mut audio_capture).await;
-                        // Drop the typing surface synchronously so any
-                        // Final/Partial events the backend emits while
-                        // draining its internal buffer reach the event-pump
-                        // arm with `streaming_session = None` and get
-                        // discarded instead of typed into whatever window
-                        // has focus by then.
-                        streaming_session = None;
-                        streaming_chain = None;
+                        if disown_output {
+                            // Drop the typing surface synchronously so any
+                            // Final/Partial events the backend emits while
+                            // draining its internal buffer reach the event-pump
+                            // arm with `streaming_session = None` and get
+                            // discarded instead of typed into whatever window
+                            // has focus by then.
+                            streaming_session = None;
+                            streaming_chain = None;
+                        }
                     } else if let State::Recording { model_override, .. } = &state {
                         let transcriber = match self.get_transcriber_for_recording(
                             model_override.as_deref(),
@@ -4101,6 +4123,19 @@ mod tests {
         // We can't easily mock Config::runtime_dir(), so we test the file operations
         // directly using the same logic as the functions under test
         f(runtime_dir)
+    }
+
+    #[test]
+    fn elevenlabs_stop_drains_the_bounded_final_commit() {
+        assert!(!should_disown_streaming_output_on_stop(
+            crate::config::TranscriptionEngine::ElevenLabs
+        ));
+        assert!(should_disown_streaming_output_on_stop(
+            crate::config::TranscriptionEngine::Parakeet
+        ));
+        assert!(should_disown_streaming_output_on_stop(
+            crate::config::TranscriptionEngine::Soniox
+        ));
     }
 
     #[test]
