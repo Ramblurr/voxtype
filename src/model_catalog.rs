@@ -722,6 +722,12 @@ mod tests {
     #[test]
     fn catalog_covers_the_settable_engines() {
         for name in ENGINE_NAMES {
+            if *name == "elevenlabs" {
+                // Cloud Scribe models are selected by mode, never downloaded.
+                assert!(model_catalog(name).is_empty());
+                assert_eq!(download_arg(name, "scribe_v2"), None);
+                continue;
+            }
             assert!(
                 CATALOG_ENGINES.contains(name),
                 "engine '{}' is settable but has no model catalog",

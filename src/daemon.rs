@@ -428,6 +428,283 @@ fn peek_file_output_path(config: &Config) -> Option<PathBuf> {
     }
 }
 
+struct EffectiveStreamingOutput {
+    config: crate::config::OutputConfig,
+    profile_post_process: bool,
+}
+
+fn resolve_streaming_output_config(
+    base: &crate::config::OutputConfig,
+    output_override: Option<OutputOverride>,
+    profile: Option<&crate::config::Profile>,
+    auto_submit_override: Option<bool>,
+    shift_enter_override: Option<bool>,
+) -> EffectiveStreamingOutput {
+    let mut config = base.clone();
+
+    let override_mode = match output_override {
+        Some(OutputOverride::Mode(mode)) => Some(mode),
+        Some(OutputOverride::FileWithPath(path)) => {
+            config.file_path = Some(path);
+            Some(OutputMode::File)
+        }
+        None => None,
+    };
+    if let Some(mode) = override_mode {
+        config.mode = mode;
+    } else if let Some(mode) = profile.and_then(|profile| profile.output_mode.clone()) {
+        config.mode = mode;
+    }
+
+    if let Some(auto_submit) = auto_submit_override {
+        config.auto_submit = auto_submit;
+    }
+    if let Some(shift_enter) = shift_enter_override {
+        config.shift_enter_newlines = shift_enter;
+    }
+
+    EffectiveStreamingOutput {
+        config,
+        profile_post_process: profile
+            .and_then(|profile| profile.post_process_command.as_ref())
+            .is_some(),
+    }
+}
+
+/// Whether a stopped stream should discard backend flush events.
+///
+/// ElevenLabs has a bounded explicit-commit drain, so keep its output attached
+/// long enough to deliver the final phrase after push-to-talk is released.
+fn should_disown_streaming_output_on_stop(engine: crate::config::TranscriptionEngine) -> bool {
+    !matches!(engine, crate::config::TranscriptionEngine::ElevenLabs)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamingStopReason {
+    PushToTalk,
+    Toggle,
+    Timeout,
+}
+
+#[derive(Debug)]
+enum StreamingPumpAction {
+    Continue,
+    BackendError(crate::error::TranscribeError),
+    Ended,
+}
+
+fn mirror_streaming_session_state(state: &mut State, session: &StreamingSession) {
+    if let State::Streaming {
+        partial_buffer,
+        finalized_text,
+        typed_chars,
+        ..
+    } = state
+    {
+        partial_buffer.clear();
+        partial_buffer.push_str(session.partial());
+        finalized_text.clear();
+        finalized_text.push_str(session.finalized_text());
+        *typed_chars = session.typed_chars();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_streaming_event_to_cursor(
+    event: StreamingEvent,
+    state: &mut State,
+    streaming_session: &mut Option<StreamingSession>,
+    streaming_chain: Option<&[Box<dyn TextOutput>]>,
+    text_processor: Option<&TextProcessor>,
+    pre_output_command: Option<&str>,
+    post_output_command: Option<&str>,
+    output_disowned: bool,
+) -> std::result::Result<StreamingPumpAction, crate::error::OutputError> {
+    let file_output = matches!(
+        state,
+        State::Streaming {
+            file_output_path: Some(_),
+            ..
+        }
+    );
+    if file_output {
+        let session = streaming_session
+            .as_mut()
+            .ok_or(crate::error::OutputError::AllMethodsFailed)?;
+        match &event {
+            StreamingEvent::Partial { text, .. } => session.observe_partial_delta(text),
+            StreamingEvent::Final { text, .. } => session.commit_segment_silent(text),
+            StreamingEvent::Replace {
+                backspace, text, ..
+            } => session.replace_and_commit_silent(*backspace, text),
+            StreamingEvent::Error(_) | StreamingEvent::Ended => {}
+            StreamingEvent::RevisePartial { .. } => {
+                return Err(crate::error::OutputError::AllMethodsFailed)
+            }
+        }
+        mirror_streaming_session_state(state, session);
+        return Ok(match event {
+            StreamingEvent::Error(error) => StreamingPumpAction::BackendError(error),
+            StreamingEvent::Ended => StreamingPumpAction::Ended,
+            _ => StreamingPumpAction::Continue,
+        });
+    }
+    if output_disowned
+        && matches!(
+            &event,
+            StreamingEvent::Partial { .. }
+                | StreamingEvent::RevisePartial { .. }
+                | StreamingEvent::Final { .. }
+                | StreamingEvent::Replace { .. }
+        )
+    {
+        return Ok(StreamingPumpAction::Continue);
+    }
+
+    match event {
+        StreamingEvent::Partial { text, .. } => {
+            let session = streaming_session
+                .as_mut()
+                .ok_or(crate::error::OutputError::AllMethodsFailed)?;
+            let chain = streaming_chain.ok_or(crate::error::OutputError::AllMethodsFailed)?;
+            session
+                .type_partial_delta(chain, text, pre_output_command, post_output_command)
+                .await?;
+            mirror_streaming_session_state(state, session);
+            Ok(StreamingPumpAction::Continue)
+        }
+        StreamingEvent::RevisePartial {
+            backspace, text, ..
+        } => {
+            let session = streaming_session
+                .as_mut()
+                .ok_or(crate::error::OutputError::AllMethodsFailed)?;
+            let chain = streaming_chain.ok_or(crate::error::OutputError::AllMethodsFailed)?;
+            session
+                .revise_partial(
+                    chain,
+                    backspace,
+                    &text,
+                    pre_output_command,
+                    post_output_command,
+                )
+                .await?;
+            mirror_streaming_session_state(state, session);
+            Ok(StreamingPumpAction::Continue)
+        }
+        StreamingEvent::Final { text, .. } => {
+            let session = streaming_session
+                .as_mut()
+                .ok_or(crate::error::OutputError::AllMethodsFailed)?;
+            let chain = streaming_chain.ok_or(crate::error::OutputError::AllMethodsFailed)?;
+            session
+                .commit_segment(
+                    chain,
+                    &text,
+                    text_processor,
+                    pre_output_command,
+                    post_output_command,
+                )
+                .await?;
+            mirror_streaming_session_state(state, session);
+            Ok(StreamingPumpAction::Continue)
+        }
+        StreamingEvent::Replace {
+            backspace, text, ..
+        } => {
+            let session = streaming_session
+                .as_mut()
+                .ok_or(crate::error::OutputError::AllMethodsFailed)?;
+            let chain = streaming_chain.ok_or(crate::error::OutputError::AllMethodsFailed)?;
+            session
+                .replace_and_commit(
+                    chain,
+                    backspace,
+                    &text,
+                    text_processor,
+                    pre_output_command,
+                    post_output_command,
+                )
+                .await?;
+            mirror_streaming_session_state(state, session);
+            Ok(StreamingPumpAction::Continue)
+        }
+        StreamingEvent::Error(error) => Ok(StreamingPumpAction::BackendError(error)),
+        StreamingEvent::Ended => Ok(StreamingPumpAction::Ended),
+    }
+}
+
+async fn abort_streaming_resources_fail_closed(
+    state: &mut State,
+    audio_capture: &mut Option<Box<dyn AudioCapture>>,
+    streaming_handle: &mut Option<StreamHandle>,
+    streaming_session: &mut Option<StreamingSession>,
+    streaming_chain: &mut Option<Vec<Box<dyn TextOutput>>>,
+    level_emitter_task: &mut Option<tokio::task::JoinHandle<()>>,
+) {
+    if let Some(task) = level_emitter_task.take() {
+        task.abort();
+        let _ = task.await;
+    }
+
+    let backend_task = streaming_handle.take().map(|handle| {
+        let StreamHandle {
+            events,
+            cancel,
+            task,
+        } = handle;
+        drop(events);
+        let _ = cancel.send(());
+        task
+    });
+
+    if let Some(mut capture) = audio_capture.take() {
+        let _ = capture.stop().await;
+    }
+    if let Some(task) = backend_task {
+        let _ = task.await;
+    }
+
+    // Do not rewind: the cursor may already reflect successful BackSpaces.
+    *streaming_session = None;
+    *streaming_chain = None;
+    *state = State::Idle;
+}
+
+fn streaming_output_failure_message(
+    error: &crate::error::OutputError,
+    engine: crate::config::TranscriptionEngine,
+) -> String {
+    let remediation = match engine {
+        crate::config::TranscriptionEngine::ElevenLabs => {
+            "or use [elevenlabs] mode = \"realtime\" to disable provisional cursor edits"
+        }
+        crate::config::TranscriptionEngine::Soniox => {
+            "or use [soniox] type_partials = false to disable provisional cursor edits"
+        }
+        _ => "or disable provisional partial typing for the selected streaming backend",
+    };
+    format!(
+        "Streaming output stopped because VoxType could not keep the cursor synchronized: {error} \
+         Visible text was left in place. Check that wtype, dotool/dotoold, or ydotool works, \
+         {remediation}."
+    )
+}
+
+async fn run_streaming_terminal_post_output(
+    post_output_hook_already_ran: bool,
+    command: Option<&str>,
+) {
+    if post_output_hook_already_ran {
+        return;
+    }
+    if let Some(command) = command {
+        if let Err(error) = output::run_hook(command, "post_output").await {
+            tracing::warn!("{error}");
+        }
+    }
+}
+
 /// Read and consume the output mode override file
 /// Format: "type", "clipboard", "paste", "file", or "file:/path/to/file.txt"
 fn read_output_mode_override() -> Option<OutputOverride> {
@@ -591,6 +868,15 @@ fn read_bool_override(name: &str) -> Option<bool> {
             None
         }
     }
+}
+
+#[cfg(test)]
+fn cleanup_recording_override_files_in(runtime_dir: &std::path::Path) {
+    discard_recording_overrides_in(runtime_dir);
+}
+
+fn cleanup_recording_override_files() {
+    discard_recording_overrides();
 }
 
 // === Meeting Mode IPC ===
@@ -1515,17 +1801,43 @@ impl Daemon {
         }
     }
 
+    fn take_elevenlabs_streaming_output_config(
+        &self,
+    ) -> std::result::Result<crate::config::OutputConfig, crate::error::TranscribeError> {
+        let output_override = read_output_mode_override();
+        let profile_name = read_profile_override();
+        let profile = profile_name
+            .as_deref()
+            .and_then(|name| self.config.get_profile(name));
+        if let Some(name) = profile_name.as_deref() {
+            if profile.is_none() {
+                tracing::warn!(
+                    "Profile '{}' not found in config, using default streaming settings",
+                    name
+                );
+            }
+        }
+
+        let effective = resolve_streaming_output_config(
+            &self.config.output,
+            output_override,
+            profile,
+            read_bool_override("auto_submit"),
+            read_bool_override("shift_enter"),
+        );
+        crate::transcribe::validate_elevenlabs_realtime_output(
+            &effective.config,
+            effective.profile_post_process,
+        )?;
+        Ok(effective.config)
+    }
+
     /// Attempt to start a streaming transcription session.
     ///
-    /// Returns `true` and populates the streaming locals on success. Returns
-    /// `false` (and does nothing) when:
-    /// - the preloaded transcriber is `None` (e.g., on_demand_loading without
-    ///   a successful background load yet);
-    /// - the preloaded transcriber's `as_streaming()` returns `None`;
-    /// - audio capture or `start_stream` fail.
-    ///
-    /// On `false`, callers should fall through to the existing batch
-    /// recording path.
+    /// Returns `true` when streaming starts or when an ElevenLabs realtime
+    /// configuration error has been handled. Returns `false` when the caller
+    /// should fall through to the existing batch recording path because the
+    /// transcriber has no streaming surface or generic streaming setup failed.
     #[allow(clippy::too_many_arguments)]
     async fn try_start_streaming(
         &mut self,
@@ -1560,21 +1872,55 @@ impl Daemon {
             return false;
         }
 
+        let elevenlabs_realtime = matches!(
+            self.config.engine,
+            crate::config::TranscriptionEngine::ElevenLabs
+        );
+        let output_config = if elevenlabs_realtime {
+            match self.take_elevenlabs_streaming_output_config() {
+                Ok(output) => output,
+                Err(error) => {
+                    let message = error.to_string();
+                    tracing::error!("Cannot start ElevenLabs realtime transcription: {message}");
+                    self.play_feedback(SoundEvent::Error);
+                    cleanup_recording_override_files();
+                    send_notification(
+                        "ElevenLabs Realtime Unavailable",
+                        &message,
+                        self.config.output.notification.show_engine_icon,
+                        self.config.engine,
+                        "critical",
+                    )
+                    .await;
+                    return true;
+                }
+            }
+        } else {
+            self.config.output.clone()
+        };
+
         let (capture, samples_rx) = match self.start_streaming_capture(track_silence).await {
-            Ok(v) => v,
-            Err(()) => return false,
+            Ok(value) => value,
+            Err(()) => {
+                if elevenlabs_realtime {
+                    cleanup_recording_override_files();
+                }
+                return elevenlabs_realtime;
+            }
         };
 
         let streaming = transcriber.as_streaming().expect("checked above");
         let handle = match streaming.start_stream(samples_rx) {
-            Ok(h) => h,
-            Err(e) => {
-                tracing::error!("Failed to start streaming session: {}", e);
+            Ok(handle) => handle,
+            Err(error) => {
+                tracing::error!("Failed to start streaming session: {error}");
                 self.play_feedback(SoundEvent::Error);
-                // Drop the capture cleanly; ignore final samples.
-                let mut c = capture;
-                let _ = c.stop().await;
-                return false;
+                let mut capture = capture;
+                let _ = capture.stop().await;
+                if elevenlabs_realtime {
+                    cleanup_recording_override_files();
+                }
+                return elevenlabs_realtime;
             }
         };
 
@@ -1588,8 +1934,8 @@ impl Daemon {
 
         *audio_capture = Some(capture);
         *streaming_handle = Some(handle);
-        *streaming_session = Some(StreamingSession::new());
-        *streaming_chain = Some(output::create_output_chain(&self.config.output));
+        *streaming_session = Some(StreamingSession::new(output_config.type_delay_ms));
+        *streaming_chain = Some(output::create_output_chain(&output_config));
         *state = State::Streaming {
             started_at: std::time::Instant::now(),
             model_override,
@@ -1601,19 +1947,19 @@ impl Daemon {
         self.update_state("streaming");
         self.play_feedback(SoundEvent::RecordingStart);
 
-        if let Some(cmd) = &self.config.output.pre_recording_command {
-            if let Err(e) = output::run_hook(cmd, "pre_recording").await {
-                tracing::warn!("{}", e);
+        if let Some(cmd) = &output_config.pre_recording_command {
+            if let Err(error) = output::run_hook(cmd, "pre_recording").await {
+                tracing::warn!("{error}");
             }
         }
 
-        if self.config.output.notification.on_recording_start {
+        if output_config.notification.on_recording_start {
             send_notification(
                 "Streaming Active",
                 "Listening...",
-                self.config.output.notification.show_engine_icon,
+                output_config.notification.show_engine_icon,
                 self.config.engine,
-                &self.config.output.notification.urgency,
+                &output_config.notification.urgency,
             )
             .await;
         }
@@ -1690,7 +2036,7 @@ impl Daemon {
                 tracing::info!("Stopping streaming session; closing capture and disowning session");
             }
             self.stop_streaming_capture(audio_capture).await;
-            if !file_output {
+            if !file_output && should_disown_streaming_output_on_stop(self.config.engine) {
                 // Drop the typing surface synchronously so any
                 // Final/Partial events the backend emits while
                 // draining its internal buffer reach the event-pump
@@ -1813,6 +2159,19 @@ impl Daemon {
         self.restore_recording_media();
     }
 
+    async fn stop_streaming_for_reason(
+        &mut self,
+        audio_capture: &mut Option<Box<dyn AudioCapture>>,
+        output_disowned: &mut bool,
+        reason: StreamingStopReason,
+    ) -> bool {
+        self.stop_streaming_capture(audio_capture).await;
+        let disown = should_disown_streaming_output_on_stop(self.config.engine);
+        *output_disowned = disown;
+        tracing::debug!(?reason, disown, "Streaming input stopped");
+        disown
+    }
+
     async fn end_streaming(
         &mut self,
         state: &mut State,
@@ -1821,6 +2180,9 @@ impl Daemon {
         streaming_session: &mut Option<StreamingSession>,
         streaming_chain: &mut Option<Vec<Box<dyn TextOutput>>>,
     ) {
+        let post_output_hook_attempted = streaming_session
+            .as_ref()
+            .is_some_and(StreamingSession::post_output_hook_attempted);
         if let Some(mut c) = audio_capture.take() {
             let _ = c.stop().await;
         }
@@ -1888,14 +2250,14 @@ impl Daemon {
 
         *streaming_session = None;
         *streaming_chain = None;
+        cleanup_recording_override_files();
 
         self.play_feedback(SoundEvent::TranscriptionComplete);
-
-        if let Some(cmd) = &self.config.output.post_output_command {
-            if let Err(e) = output::run_hook(cmd, "post_output").await {
-                tracing::warn!("{}", e);
-            }
-        }
+        run_streaming_terminal_post_output(
+            post_output_hook_attempted,
+            self.config.output.post_output_command.as_deref(),
+        )
+        .await;
 
         *state = State::Idle;
         self.update_state("idle");
@@ -2021,6 +2383,52 @@ impl Daemon {
         }
     }
 
+    /// Abort a streaming session after cursor revision output diverges from
+    /// provider state. Visible text is preserved without rewind.
+    #[allow(clippy::too_many_arguments)]
+    async fn fail_streaming_output_to_idle(
+        &mut self,
+        state: &mut State,
+        audio_capture: &mut Option<Box<dyn AudioCapture>>,
+        streaming_handle: &mut Option<StreamHandle>,
+        streaming_session: &mut Option<StreamingSession>,
+        streaming_chain: &mut Option<Vec<Box<dyn TextOutput>>>,
+        error: &crate::error::OutputError,
+    ) {
+        let post_output_hook_attempted = streaming_session
+            .as_ref()
+            .is_some_and(StreamingSession::post_output_hook_attempted);
+        tracing::error!("Fatal streaming cursor output failure: {error}");
+        abort_streaming_resources_fail_closed(
+            state,
+            audio_capture,
+            streaming_handle,
+            streaming_session,
+            streaming_chain,
+            &mut self.level_emitter_task,
+        )
+        .await;
+        self.stop_streaming_drain_pump();
+        cleanup_recording_override_files();
+        self.restore_recording_media();
+        self.update_state("idle");
+        self.play_feedback(SoundEvent::Error);
+        run_streaming_terminal_post_output(
+            post_output_hook_attempted,
+            self.config.output.post_output_command.as_deref(),
+        )
+        .await;
+
+        send_notification(
+            "Streaming Output Stopped",
+            &streaming_output_failure_message(error, self.config.engine),
+            self.config.output.notification.show_engine_icon,
+            self.config.engine,
+            "critical",
+        )
+        .await;
+    }
+
     /// Cancel an active streaming session: signal the backend, drop capture,
     /// rewind any typed text, and reset to idle (with cancel feedback +
     /// notification).
@@ -2034,6 +2442,9 @@ impl Daemon {
         streaming_chain: &mut Option<Vec<Box<dyn TextOutput>>>,
         notification_body: &str,
     ) {
+        let post_output_hook_attempted = streaming_session
+            .as_ref()
+            .is_some_and(StreamingSession::post_output_hook_attempted);
         let backend_task = streaming_handle.take().map(|h| {
             let _ = h.cancel.send(());
             h.task
@@ -2059,12 +2470,11 @@ impl Daemon {
         *state = State::Idle;
         self.update_state("idle");
         self.play_feedback(SoundEvent::Cancelled);
-
-        if let Some(cmd) = &self.config.output.post_output_command {
-            if let Err(e) = output::run_hook(cmd, "post_output").await {
-                tracing::warn!("{}", e);
-            }
-        }
+        run_streaming_terminal_post_output(
+            post_output_hook_attempted,
+            self.config.output.post_output_command.as_deref(),
+        )
+        .await;
 
         if self.config.output.notification.on_recording_stop {
             send_notification(
@@ -2184,7 +2594,8 @@ impl Daemon {
                 | crate::config::TranscriptionEngine::Omnilingual
                 | crate::config::TranscriptionEngine::Cohere
                 | crate::config::TranscriptionEngine::OpenVino
-                | crate::config::TranscriptionEngine::Soniox => {
+                | crate::config::TranscriptionEngine::Soniox
+                | crate::config::TranscriptionEngine::ElevenLabs => {
                     let config = self.config.clone();
                     self.model_load_task = Some(tokio::task::spawn_blocking(move || {
                         crate::transcribe::create_transcriber(&config).map(Arc::from)
@@ -2215,7 +2626,8 @@ impl Daemon {
                 | crate::config::TranscriptionEngine::Omnilingual
                 | crate::config::TranscriptionEngine::Cohere
                 | crate::config::TranscriptionEngine::OpenVino
-                | crate::config::TranscriptionEngine::Soniox => {
+                | crate::config::TranscriptionEngine::Soniox
+                | crate::config::TranscriptionEngine::ElevenLabs => {
                     if let Some(ref t) = self.transcriber_preloaded {
                         let transcriber = t.clone();
                         tokio::task::spawn_blocking(move || {
@@ -2453,6 +2865,7 @@ impl Daemon {
                 | crate::config::TranscriptionEngine::Omnilingual
                 | crate::config::TranscriptionEngine::Cohere
                 | crate::config::TranscriptionEngine::OpenVino
+                | crate::config::TranscriptionEngine::ElevenLabs
                 | crate::config::TranscriptionEngine::Soniox => {
                     if let Some(t) = self.transcriber_preloaded.clone() {
                         Ok(t)
@@ -3776,14 +4189,12 @@ impl Daemon {
         // #450 — the silent v0.6.x to v0.7.0 wrapper-flip incident.
         self.warn_on_variant_mismatch();
 
-        // Streaming dictation types characters at the cursor while the user is
-        // still holding the PTT key. On Wayland compositors backed by libinput
-        // (Hyprland, Sway, River) those synthetic key events clobber the held-
-        // key state tracker, so the physical key release never fires bindrd and
-        // the daemon gets stuck in streaming. Force toggle activation when
-        // streaming is enabled. The user's config file is left untouched; this
-        // override only applies to the running daemon.
-        if self.config.streaming_active()
+        // Compositor-managed streaming PTT can lose its release binding when
+        // synthetic output changes libinput's held-key state. Keep the existing
+        // toggle safeguard for those bindings. ElevenLabs may use PTT with the
+        // built-in raw evdev listener, which receives the physical release
+        // independently of compositor state.
+        if self.config.streaming_requires_toggle_activation()
             && self.config.hotkey.mode == crate::config::ActivationMode::PushToTalk
         {
             tracing::warn!(
@@ -3975,6 +4386,7 @@ impl Daemon {
                 | crate::config::TranscriptionEngine::Omnilingual
                 | crate::config::TranscriptionEngine::Cohere
                 | crate::config::TranscriptionEngine::OpenVino
+                | crate::config::TranscriptionEngine::ElevenLabs
                 | crate::config::TranscriptionEngine::Soniox => {
                     // Non-Whisper engines do their own setup; Soniox just validates
                     // API key + endpoint at construction (no model to download).
@@ -4047,6 +4459,7 @@ impl Daemon {
         let mut streaming_handle: Option<StreamHandle> = None;
         let mut streaming_session: Option<StreamingSession> = None;
         let mut streaming_chain: Option<Vec<Box<dyn TextOutput>>> = None;
+        let mut streaming_output_disowned = false;
 
         // Persistent poll timers for the recording and transcribing arms. A
         // `sleep()` arm is rebuilt every loop iteration, so it competes with
@@ -4108,7 +4521,10 @@ impl Daemon {
                                     model_override.clone(),
                                     false,
                                 ).await {
-                                    tracing::info!("Streaming session started (push-to-talk)");
+                                    if state.is_streaming() {
+                                        streaming_output_disowned = false;
+                                        tracing::info!("Streaming session started (push-to-talk)");
+                                    }
                                 } else {
                                     // Create and start audio capture
                                     tracing::debug!("Creating audio capture with device: {}", self.config.audio.device);
@@ -4157,14 +4573,18 @@ impl Daemon {
                         (HotkeyEvent::Released, ActivationMode::PushToTalk) => {
                             tracing::debug!("Received HotkeyEvent::Released (push-to-talk), state.is_recording() = {}", state.is_recording());
                             if state.is_streaming() {
-                                tracing::debug!("Streaming push-to-talk released; closing audio capture and disowning session");
-                                self.stop_streaming_capture(&mut audio_capture).await;
-                                // Drop session/chain so the backend's
-                                // post-stop flush emission is dropped at
-                                // the event pump instead of typed.
-                                // Matches the SIGUSR2 stop path.
-                                streaming_session = None;
-                                streaming_chain = None;
+                                let disown_output = self
+                                    .stop_streaming_for_reason(
+                                        &mut audio_capture,
+                                        &mut streaming_output_disowned,
+                                        StreamingStopReason::PushToTalk,
+                                    )
+                                    .await;
+                                if disown_output {
+                                    tracing::debug!("Streaming push-to-talk released; capture closed and output disowned");
+                                } else {
+                                    tracing::debug!("Streaming push-to-talk released; capture closed and awaiting final commit");
+                                }
                             } else if let State::Recording { model_override, .. } = &state {
                                 let model_override = model_override.clone();
 
@@ -4258,7 +4678,10 @@ impl Daemon {
                                     model_override.clone(),
                                     false,
                                 ).await {
-                                    tracing::info!("Streaming session started (toggle)");
+                                    if state.is_streaming() {
+                                        streaming_output_disowned = false;
+                                        tracing::info!("Streaming session started (toggle)");
+                                    }
                                 } else {
                                     match self.start_recording_capture(false).await {
                                         Ok(capture) => {
@@ -4299,8 +4722,13 @@ impl Daemon {
                                     }
                                 }
                             } else if state.is_streaming() {
-                                tracing::info!("Toggle stop while streaming; closing capture");
-                                self.stop_streaming_capture(&mut audio_capture).await;
+                                self.stop_streaming_for_reason(
+                                    &mut audio_capture,
+                                    &mut streaming_output_disowned,
+                                    StreamingStopReason::Toggle,
+                                )
+                                .await;
+                                tracing::info!("Toggle stop while streaming; capture closed");
                             } else if let State::Recording { model_override: current_model_override, .. } = &state {
                                 let model_override = current_model_override.clone();
 
@@ -4589,7 +5017,12 @@ impl Daemon {
                                 "Recording timeout ({:.0}s limit) while streaming; closing capture",
                                 max_duration.as_secs_f32()
                             );
-                            self.stop_streaming_capture(&mut audio_capture).await;
+                            self.stop_streaming_for_reason(
+                                &mut audio_capture,
+                                &mut streaming_output_disowned,
+                                StreamingStopReason::Timeout,
+                            )
+                            .await;
                             continue;
                         }
 
@@ -4701,7 +5134,10 @@ impl Daemon {
                             model_override.clone(),
                             true,
                         ).await {
-                            tracing::info!("Streaming session started (SIGUSR1)");
+                            if state.is_streaming() {
+                                streaming_output_disowned = false;
+                                tracing::info!("Streaming session started (SIGUSR1)");
+                            }
                         } else {
                             match self.start_recording_capture(true).await {
                                 Ok(capture) => {
@@ -4787,88 +5223,24 @@ impl Daemon {
                         None => std::future::pending().await,
                     }
                 }, if state.is_streaming() && streaming_handle.is_some() => {
-                    // File-output sessions (`--file=path`) accumulate into
-                    // finalized_text via the `_silent` session methods
-                    // instead of typing through `chain` — there's no
-                    // cursor/focused window to type into, and doing so
-                    // anyway is exactly the leak this branch exists to
-                    // avoid (see the SIGUSR2 handler below).
-                    let file_output = matches!(
-                        &state,
-                        State::Streaming { file_output_path: Some(_), .. }
-                    );
-                    match event {
-                        Some(StreamingEvent::Partial { text, .. }) => {
-                            if let Some(s) = streaming_session.as_mut() {
-                                if file_output {
-                                    s.observe_partial_delta(&text);
-                                } else if let Some(chain) = streaming_chain.as_ref() {
-                                    if let Err(e) = s.type_partial_delta(
-                                        chain,
-                                        text,
-                                        self.config.output.pre_output_command.as_deref(),
-                                        self.config.output.post_output_command.as_deref(),
-                                    ).await {
-                                        tracing::warn!("Streaming partial delta type failed: {}", e);
-                                    }
-                                }
-                                if let State::Streaming { typed_chars, .. } = &mut state {
-                                    *typed_chars = s.typed_chars();
-                                }
-                            }
-                        }
-                        Some(StreamingEvent::Final { text, .. }) => {
-                            if let Some(s) = streaming_session.as_mut() {
-                                if file_output {
-                                    // Raw on purpose: file-mode text is
-                                    // processed once, whole, at write time
-                                    // in end_streaming — that also catches
-                                    // matches spanning segment boundaries.
-                                    s.commit_segment_silent(&text);
-                                } else if let Some(chain) = streaming_chain.as_ref() {
-                                    if let Err(e) = s.commit_segment(
-                                        chain,
-                                        &text,
-                                        Some(&self.text_processor),
-                                        self.config.output.pre_output_command.as_deref(),
-                                        self.config.output.post_output_command.as_deref(),
-                                    ).await {
-                                        tracing::error!("Streaming commit_segment failed: {}", e);
-                                    }
-                                }
-                                // Mirror typed_chars onto the state for cancel-rewind.
-                                if let State::Streaming { typed_chars, finalized_text, .. } = &mut state {
-                                    *typed_chars = s.typed_chars();
-                                    finalized_text.clear();
-                                    finalized_text.push_str(s.finalized_text());
-                                }
-                            }
-                        }
-                        Some(StreamingEvent::Replace { backspace, text, .. }) => {
-                            if let Some(s) = streaming_session.as_mut() {
-                                if file_output {
-                                    // Raw on purpose — see the Final arm.
-                                    s.replace_and_commit_silent(backspace, &text);
-                                } else if let Some(chain) = streaming_chain.as_ref() {
-                                    if let Err(e) = s.replace_and_commit(
-                                        chain,
-                                        backspace,
-                                        &text,
-                                        Some(&self.text_processor),
-                                        self.config.output.pre_output_command.as_deref(),
-                                        self.config.output.post_output_command.as_deref(),
-                                    ).await {
-                                        tracing::error!("Streaming replace_and_commit failed: {}", e);
-                                    }
-                                }
-                                if let State::Streaming { typed_chars, finalized_text, .. } = &mut state {
-                                    *typed_chars = s.typed_chars();
-                                    finalized_text.clear();
-                                    finalized_text.push_str(s.finalized_text());
-                                }
-                            }
-                        }
-                        Some(StreamingEvent::Error(err)) => {
+                    let output_disowned = streaming_output_disowned || streaming_session.is_none();
+                    let action = match event {
+                        Some(event) => apply_streaming_event_to_cursor(
+                            event,
+                            &mut state,
+                            &mut streaming_session,
+                            streaming_chain.as_deref(),
+                            Some(&self.text_processor),
+                            self.config.output.pre_output_command.as_deref(),
+                            self.config.output.post_output_command.as_deref(),
+                            output_disowned,
+                        ).await,
+                        None => Ok(StreamingPumpAction::Ended),
+                    };
+
+                    match action {
+                        Ok(StreamingPumpAction::Continue) => {}
+                        Ok(StreamingPumpAction::BackendError(err)) => {
                             tracing::error!("Streaming backend error: {}", err);
                             send_notification(
                                 "Streaming Error",
@@ -4885,13 +5257,23 @@ impl Daemon {
                                 &mut streaming_chain,
                             ).await;
                         }
-                        Some(StreamingEvent::Ended) | None => {
+                        Ok(StreamingPumpAction::Ended) => {
                             self.end_streaming(
                                 &mut state,
                                 &mut audio_capture,
                                 &mut streaming_handle,
                                 &mut streaming_session,
                                 &mut streaming_chain,
+                            ).await;
+                        }
+                        Err(error) => {
+                            self.fail_streaming_output_to_idle(
+                                &mut state,
+                                &mut audio_capture,
+                                &mut streaming_handle,
+                                &mut streaming_session,
+                                &mut streaming_chain,
+                                &error,
                             ).await;
                         }
                     }
@@ -5449,6 +5831,680 @@ mod tests {
         // We can't easily mock Config::runtime_dir(), so we test the file operations
         // directly using the same logic as the functions under test
         f(runtime_dir)
+    }
+
+    #[tokio::test]
+    async fn toggle_and_timeout_stops_apply_the_streaming_disown_policy() {
+        for reason in [StreamingStopReason::Toggle, StreamingStopReason::Timeout] {
+            let soniox_config = Config {
+                engine: crate::config::TranscriptionEngine::Soniox,
+                ..Config::default()
+            };
+            let mut soniox = Daemon::new(soniox_config, None);
+            let mut capture = None;
+            let mut disowned = false;
+            let result = soniox
+                .stop_streaming_for_reason(&mut capture, &mut disowned, reason)
+                .await;
+
+            let elevenlabs_config = Config {
+                engine: crate::config::TranscriptionEngine::ElevenLabs,
+                ..Config::default()
+            };
+            let mut elevenlabs = Daemon::new(elevenlabs_config, None);
+            let mut capture = None;
+            let mut elevenlabs_disowned = true;
+            let elevenlabs_result = elevenlabs
+                .stop_streaming_for_reason(&mut capture, &mut elevenlabs_disowned, reason)
+                .await;
+
+            assert_eq!(
+                (
+                    reason,
+                    result,
+                    disowned,
+                    elevenlabs_result,
+                    elevenlabs_disowned
+                ),
+                (reason, true, true, false, false),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn signal_stop_preserves_elevenlabs_and_file_output_drain() {
+        use crate::config::TranscriptionEngine;
+        for (engine, file_output, keep_session) in [
+            (TranscriptionEngine::ElevenLabs, false, true),
+            (TranscriptionEngine::Whisper, true, true),
+            (TranscriptionEngine::Soniox, false, false),
+        ] {
+            let mut daemon = Daemon::new(
+                Config {
+                    engine,
+                    ..Config::default()
+                },
+                None,
+            );
+            let mut state = streaming_test_state("", "", 0);
+            if file_output {
+                if let State::Streaming {
+                    file_output_path, ..
+                } = &mut state
+                {
+                    *file_output_path = Some(PathBuf::from("transcript.txt"));
+                }
+            }
+            let mut session = Some(StreamingSession::new(0));
+            let mut chain = Some(Vec::new());
+            daemon
+                .stop_active_recording(&mut state, &mut None, &mut session, &mut chain, &mut None)
+                .await;
+            assert_eq!(
+                (session.is_some(), chain.is_some()),
+                (keep_session, keep_session)
+            );
+        }
+    }
+
+    #[test]
+    fn elevenlabs_stop_drains_the_bounded_final_commit() {
+        assert!(!should_disown_streaming_output_on_stop(
+            crate::config::TranscriptionEngine::ElevenLabs
+        ));
+        assert!(should_disown_streaming_output_on_stop(
+            crate::config::TranscriptionEngine::Parakeet
+        ));
+        assert!(should_disown_streaming_output_on_stop(
+            crate::config::TranscriptionEngine::Soniox
+        ));
+    }
+
+    struct FailingStreamingOutput;
+
+    #[async_trait::async_trait]
+    impl TextOutput for FailingStreamingOutput {
+        async fn output(&self, _text: &str) -> std::result::Result<(), crate::error::OutputError> {
+            Err(crate::error::OutputError::InjectionFailed(
+                "test failure".to_string(),
+            ))
+        }
+
+        async fn is_available(&self) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "failing-streaming-test"
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingStreamingOutput {
+        typed: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl TextOutput for RecordingStreamingOutput {
+        async fn output(&self, text: &str) -> std::result::Result<(), crate::error::OutputError> {
+            self.typed.lock().unwrap().push(text.to_string());
+            Ok(())
+        }
+
+        async fn is_available(&self) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "recording-streaming-test"
+        }
+    }
+
+    fn streaming_test_state(partial: &str, finalized: &str, typed_chars: usize) -> State {
+        State::Streaming {
+            started_at: Instant::now(),
+            model_override: None,
+            file_output_path: None,
+            partial_buffer: partial.to_string(),
+            finalized_text: finalized.to_string(),
+            typed_chars,
+        }
+    }
+
+    #[tokio::test]
+    async fn file_streaming_keeps_revisions_silent_and_drains_after_stop() {
+        let mut state = streaming_test_state("", "", 0);
+        if let State::Streaming {
+            file_output_path, ..
+        } = &mut state
+        {
+            *file_output_path = Some(PathBuf::from("transcript.txt"));
+        }
+        let mut session = Some(StreamingSession::new(0));
+        let events = [
+            StreamingEvent::Partial {
+                text: "Open blue button.".into(),
+                segment_id: 0,
+            },
+            StreamingEvent::Replace {
+                backspace: 8,
+                text: " bubbles.".into(),
+                segment_id: 0,
+            },
+            StreamingEvent::Ended,
+        ];
+        for event in events {
+            // No typing chain: file mode must never emit keystrokes, even
+            // when a stop would disown an ordinary cursor session.
+            apply_streaming_event_to_cursor(
+                event,
+                &mut state,
+                &mut session,
+                None,
+                None,
+                None,
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        }
+        let session = session.unwrap();
+        assert_eq!(
+            (
+                session.finalized_text(),
+                session.partial(),
+                session.typed_chars()
+            ),
+            ("Open blue bubbles.", "", 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn cursor_finals_keep_upstream_text_processing() {
+        let output = RecordingStreamingOutput::default();
+        let chain: Vec<Box<dyn TextOutput>> = vec![Box::new(output)];
+        let processor = TextProcessor::new(&crate::config::TextConfig {
+            replacements: [("vox type".to_string(), "voxtype".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        });
+        let mut state = streaming_test_state("", "", 0);
+        let mut session = Some(StreamingSession::new(0));
+        apply_streaming_event_to_cursor(
+            StreamingEvent::Final {
+                text: "vox type".into(),
+                segment_id: 0,
+            },
+            &mut state,
+            &mut session,
+            Some(&chain),
+            Some(&processor),
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(session.unwrap().finalized_text(), "voxtype");
+    }
+
+    #[tokio::test]
+    async fn every_cursor_output_event_failure_requests_fail_closed_abort() {
+        let cases = [
+            StreamingEvent::Partial {
+                text: "next".to_string(),
+                segment_id: 0,
+            },
+            StreamingEvent::RevisePartial {
+                backspace: 0,
+                text: "next".to_string(),
+                segment_id: 0,
+            },
+            StreamingEvent::Final {
+                text: "next".to_string(),
+                segment_id: 0,
+            },
+            StreamingEvent::Replace {
+                backspace: 0,
+                text: "next".to_string(),
+                segment_id: 0,
+            },
+        ];
+
+        for event in cases {
+            let mut state = streaming_test_state("", "", 0);
+            let mut session = Some(StreamingSession::new(17));
+            let chain: Vec<Box<dyn TextOutput>> = vec![Box::new(FailingStreamingOutput)];
+            let error = apply_streaming_event_to_cursor(
+                event,
+                &mut state,
+                &mut session,
+                Some(&chain),
+                None,
+                None,
+                None,
+                false,
+            )
+            .await
+            .expect_err("cursor output failure must stop the event pump");
+
+            assert!(matches!(error, crate::error::OutputError::AllMethodsFailed));
+        }
+    }
+
+    #[tokio::test]
+    async fn cursor_event_with_missing_session_resources_requests_fail_closed_abort() {
+        let mut state = streaming_test_state("visible", "", 7);
+        let mut session = None;
+        let error = apply_streaming_event_to_cursor(
+            StreamingEvent::RevisePartial {
+                backspace: 1,
+                text: String::new(),
+                segment_id: 0,
+            },
+            &mut state,
+            &mut session,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect_err("missing cursor resources must fail closed");
+
+        assert!(matches!(error, crate::error::OutputError::AllMethodsFailed));
+    }
+
+    #[tokio::test]
+    async fn intentionally_disowned_cursor_events_are_discarded() {
+        let events = [
+            StreamingEvent::Partial {
+                text: "ignored".to_string(),
+                segment_id: 0,
+            },
+            StreamingEvent::RevisePartial {
+                backspace: 1,
+                text: String::new(),
+                segment_id: 0,
+            },
+            StreamingEvent::Final {
+                text: "ignored".to_string(),
+                segment_id: 0,
+            },
+            StreamingEvent::Replace {
+                backspace: 1,
+                text: "ignored".to_string(),
+                segment_id: 0,
+            },
+        ];
+
+        for event in events {
+            let mut state = streaming_test_state("visible", "", 7);
+            let mut session = None;
+            let action = apply_streaming_event_to_cursor(
+                event,
+                &mut state,
+                &mut session,
+                None,
+                None,
+                None,
+                None,
+                true,
+            )
+            .await
+            .expect("intentional disowning must discard cursor events");
+            assert!(matches!(action, StreamingPumpAction::Continue));
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_final_mirrors_cleared_provisional_state() {
+        let output = RecordingStreamingOutput::default();
+        let chain: Vec<Box<dyn TextOutput>> = vec![Box::new(output.clone())];
+        let mut session = StreamingSession::new(17);
+        session
+            .type_partial_delta(&chain, "hello".to_string(), None, None)
+            .await
+            .unwrap();
+        let mut session = Some(session);
+        let mut state = streaming_test_state("hello", "", 5);
+
+        let action = apply_streaming_event_to_cursor(
+            StreamingEvent::Final {
+                text: String::new(),
+                segment_id: 0,
+            },
+            &mut state,
+            &mut session,
+            Some(&chain),
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(action, StreamingPumpAction::Continue));
+        match state {
+            State::Streaming {
+                partial_buffer,
+                finalized_text,
+                typed_chars,
+                ..
+            } => assert_eq!(
+                (partial_buffer, finalized_text, typed_chars),
+                (String::new(), "hello".to_string(), 5),
+            ),
+            other => panic!("expected streaming state, got {other:?}"),
+        }
+        assert_eq!(*output.typed.lock().unwrap(), vec!["hello".to_string()]);
+    }
+
+    struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    struct RecordingCapture {
+        stopped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl AudioCapture for RecordingCapture {
+        async fn start(
+            &mut self,
+        ) -> std::result::Result<tokio::sync::mpsc::Receiver<Vec<f32>>, crate::error::AudioError>
+        {
+            let (_tx, rx) = tokio::sync::mpsc::channel(1);
+            Ok(rx)
+        }
+
+        async fn stop(&mut self) -> std::result::Result<Vec<f32>, crate::error::AudioError> {
+            self.stopped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+
+        async fn get_samples(&mut self) -> Vec<f32> {
+            Vec::new()
+        }
+    }
+
+    #[tokio::test]
+    async fn fail_closed_streaming_cleanup_cancels_without_rewinding_visible_text() {
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let emitter_cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let emitter_flag = DropFlag(emitter_cancelled.clone());
+        let mut level_emitter_task = Some(tokio::spawn(async move {
+            let _flag = emitter_flag;
+            std::future::pending::<()>().await;
+        }));
+        tokio::task::yield_now().await;
+        let mut capture: Option<Box<dyn AudioCapture>> = Some(Box::new(RecordingCapture {
+            stopped: stopped.clone(),
+        }));
+        let (events_tx, events_rx) = tokio::sync::mpsc::channel(2);
+        events_tx
+            .try_send(StreamingEvent::Partial {
+                text: "must be discarded".to_string(),
+                segment_id: 1,
+            })
+            .unwrap();
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        let task_cancelled = cancelled.clone();
+        let task = tokio::spawn(async move {
+            let _ = cancel_rx.await;
+            task_cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+        let mut handle = Some(StreamHandle {
+            events: events_rx,
+            cancel: cancel_tx,
+            task,
+        });
+        let mut session = Some(StreamingSession::new(17));
+        let mut chain: Option<Vec<Box<dyn TextOutput>>> = Some(Vec::new());
+        let mut state = State::Streaming {
+            started_at: Instant::now(),
+            model_override: None,
+            file_output_path: None,
+            partial_buffer: "visible provisional text".to_string(),
+            finalized_text: "committed ".to_string(),
+            typed_chars: 32,
+        };
+
+        abort_streaming_resources_fail_closed(
+            &mut state,
+            &mut capture,
+            &mut handle,
+            &mut session,
+            &mut chain,
+            &mut level_emitter_task,
+        )
+        .await;
+
+        assert_eq!(
+            (
+                state.is_idle(),
+                capture.is_none(),
+                handle.is_none(),
+                session.is_none(),
+                chain.is_none(),
+                stopped.load(std::sync::atomic::Ordering::SeqCst),
+                cancelled.load(std::sync::atomic::Ordering::SeqCst),
+                level_emitter_task.is_none(),
+                emitter_cancelled.load(std::sync::atomic::Ordering::SeqCst),
+                events_tx
+                    .try_send(StreamingEvent::Partial {
+                        text: "must not be accepted".to_string(),
+                        segment_id: 2,
+                    })
+                    .is_err(),
+            ),
+            (true, true, true, true, true, true, true, true, true, true)
+        );
+    }
+
+    #[test]
+    fn streaming_output_failure_message_is_actionable_for_each_provider() {
+        let elevenlabs = streaming_output_failure_message(
+            &crate::error::OutputError::AllMethodsFailed,
+            crate::config::TranscriptionEngine::ElevenLabs,
+        );
+        let soniox = streaming_output_failure_message(
+            &crate::error::OutputError::AllMethodsFailed,
+            crate::config::TranscriptionEngine::Soniox,
+        );
+
+        assert!(elevenlabs.contains("could not keep the cursor synchronized"));
+        assert!(elevenlabs.contains("left in place"));
+        assert!(elevenlabs.contains("wtype"));
+        assert!(elevenlabs.contains("[elevenlabs] mode = \"realtime\""));
+        assert!(!elevenlabs.contains("no viable BackSpace-capable output driver"));
+        assert!(soniox.contains("[soniox] type_partials = false"));
+        assert!(!soniox.contains("[elevenlabs]"));
+    }
+
+    #[tokio::test]
+    async fn terminal_cleanup_runs_post_output_hook_exactly_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let after_burst = temp.path().join("after-burst");
+        let failed_burst = temp.path().join("failed-burst");
+        let without_burst = temp.path().join("without-burst");
+        let after_burst_command = format!("printf x >> {}", after_burst.display());
+        let failed_burst_command = format!("printf x >> {}", failed_burst.display());
+        let without_burst_command = format!("printf x >> {}", without_burst.display());
+        let output = RecordingStreamingOutput::default();
+        let chain: Vec<Box<dyn TextOutput>> = vec![Box::new(output)];
+        let failing_chain: Vec<Box<dyn TextOutput>> = vec![Box::new(FailingStreamingOutput)];
+        let mut session = StreamingSession::new(17);
+
+        session
+            .type_partial_delta(
+                &chain,
+                "hello".to_string(),
+                None,
+                Some(&after_burst_command),
+            )
+            .await
+            .unwrap();
+        run_streaming_terminal_post_output(
+            session.post_output_hook_attempted(),
+            Some(&after_burst_command),
+        )
+        .await;
+
+        let mut failed_session = StreamingSession::new(17);
+        failed_session
+            .type_partial_delta(
+                &failing_chain,
+                "hello".to_string(),
+                None,
+                Some(&failed_burst_command),
+            )
+            .await
+            .unwrap_err();
+        run_streaming_terminal_post_output(
+            failed_session.post_output_hook_attempted(),
+            Some(&failed_burst_command),
+        )
+        .await;
+
+        let empty_session = StreamingSession::new(17);
+        run_streaming_terminal_post_output(
+            empty_session.post_output_hook_attempted(),
+            Some(&without_burst_command),
+        )
+        .await;
+
+        assert_eq!(
+            (
+                std::fs::read_to_string(after_burst).unwrap(),
+                std::fs::read_to_string(failed_burst).unwrap(),
+                std::fs::read_to_string(without_burst).unwrap(),
+            ),
+            ("x".to_string(), "x".to_string(), "x".to_string()),
+        );
+    }
+
+    #[test]
+    fn streaming_output_resolution_applies_profile_and_cli_precedence() {
+        let base = crate::config::OutputConfig::default();
+        let profile = crate::config::Profile {
+            post_process_command: Some("clean-transcript".to_string()),
+            output_mode: Some(OutputMode::Clipboard),
+            ..crate::config::Profile::default()
+        };
+
+        let from_profile = resolve_streaming_output_config(&base, None, Some(&profile), None, None);
+        assert_eq!(from_profile.config.mode, OutputMode::Clipboard);
+        assert!(from_profile.profile_post_process);
+        let error = crate::transcribe::validate_elevenlabs_realtime_output(
+            &from_profile.config,
+            from_profile.profile_post_process,
+        )
+        .expect_err("profile clipboard output must reject realtime")
+        .to_string();
+        assert!(error.contains("output.mode"));
+
+        let from_cli = resolve_streaming_output_config(
+            &base,
+            Some(OutputOverride::Mode(OutputMode::Type)),
+            Some(&profile),
+            None,
+            None,
+        );
+        assert_eq!(from_cli.config.mode, OutputMode::Type);
+        assert!(from_cli.profile_post_process);
+        let error = crate::transcribe::validate_elevenlabs_realtime_output(
+            &from_cli.config,
+            from_cli.profile_post_process,
+        )
+        .expect_err("profile post-processing must reject realtime")
+        .to_string();
+        assert!(error.contains("profile.post_process_command"));
+
+        let from_cli = resolve_streaming_output_config(
+            &base,
+            Some(OutputOverride::Mode(OutputMode::Clipboard)),
+            None,
+            None,
+            None,
+        );
+        let error = crate::transcribe::validate_elevenlabs_realtime_output(
+            &from_cli.config,
+            from_cli.profile_post_process,
+        )
+        .expect_err("per-record clipboard output must reject realtime")
+        .to_string();
+        assert!(error.contains("output.mode"));
+    }
+
+    #[test]
+    fn streaming_output_resolution_applies_boolean_overrides() {
+        let base = crate::config::OutputConfig {
+            auto_submit: true,
+            ..crate::config::OutputConfig::default()
+        };
+
+        let effective = resolve_streaming_output_config(&base, None, None, Some(false), Some(true));
+
+        assert!(!effective.config.auto_submit);
+        assert!(effective.config.shift_enter_newlines);
+        assert!(!effective.profile_post_process);
+        crate::transcribe::validate_elevenlabs_realtime_output(
+            &effective.config,
+            effective.profile_post_process,
+        )
+        .expect("per-record no-auto-submit override makes realtime safe");
+
+        let effective = resolve_streaming_output_config(
+            &crate::config::OutputConfig::default(),
+            None,
+            None,
+            Some(true),
+            None,
+        );
+        let error = crate::transcribe::validate_elevenlabs_realtime_output(
+            &effective.config,
+            effective.profile_post_process,
+        )
+        .expect_err("per-record auto-submit must reject realtime")
+        .to_string();
+        assert!(error.contains("output.auto_submit"));
+    }
+
+    #[test]
+    fn streaming_override_cleanup_removes_every_per_record_sentinel() {
+        with_test_runtime_dir(|dir| {
+            let names = [
+                "output_mode_override",
+                "model_override",
+                "profile_override",
+                "auto_submit_override",
+                "shift_enter_override",
+                "smart_auto_submit_override",
+            ];
+            for name in names {
+                fs::write(dir.join(name), "value").unwrap();
+            }
+
+            cleanup_recording_override_files_in(dir);
+
+            let remaining: Vec<_> = names
+                .into_iter()
+                .filter(|name| dir.join(name).exists())
+                .collect();
+            assert!(remaining.is_empty(), "stale overrides: {remaining:?}");
+        });
     }
 
     #[test]

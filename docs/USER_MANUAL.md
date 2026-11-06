@@ -525,6 +525,46 @@ language_hints = ["en"]
 
 See [SONIOX.md](SONIOX.md) for the full reference (realtime vs async modes, performance tips with dotoold, privacy considerations).
 
+### Cloud Backend: ElevenLabs
+
+ElevenLabs Scribe supports batch transcription after release, committed-only
+realtime typing, and revisable provisional partial typing.
+
+Build with `--features elevenlabs`, set `ELEVENLABS_API_KEY`, and use manual
+partials with provider cleanup for live cleanup:
+
+```toml
+engine = "elevenlabs"
+
+[hotkey]
+mode = "push_to_talk"
+
+[output]
+type_delay_ms = 17
+
+[elevenlabs]
+mode = "partials"
+commit_strategy = "manual"
+no_verbatim = true
+```
+
+`no_verbatim` asks ElevenLabs to remove detected fillers, false starts, and
+disfluencies. Manual commit keeps an ordinary pause from finalizing the current
+segment, so a later partial may revise punctuation or wording with more
+context. Release the hotkey to commit the remaining segment.
+
+Use `mode = "realtime"` when you want only committed text and no provisional
+cursor edits. With manual commit, committed-only realtime output normally waits
+until release or the provider's automatic long-session commit. Use
+`commit_strategy = "vad"` for the previous silence-based behavior, or
+`mode = "batch"` for one transcript after release.
+
+Built-in evdev hotkeys support push-to-talk in every mode. If compositor
+bindings call `voxtype record`, use toggle for `realtime` and `partials` so
+synthetic typing cannot hide the compositor's key-release binding. See
+[CONFIGURATION.md](CONFIGURATION.md#elevenlabs) for every option and output
+driver requirements.
+
 ### Creating a Custom Configuration
 
 ```bash
