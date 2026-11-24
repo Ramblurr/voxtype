@@ -308,6 +308,7 @@ pub(crate) fn apply_cli_overrides(config: &mut config::Config, cli: &Cli) -> Opt
         || cli.elevenlabs_language.is_some()
         || cli.elevenlabs_mode.is_some()
         || cli.elevenlabs_model.is_some()
+        || cli.elevenlabs_realtime_model.is_some()
         || cli.elevenlabs_commit_strategy.is_some()
         || cli.elevenlabs_no_verbatim
         || cli.elevenlabs_verbatim
@@ -335,6 +336,9 @@ pub(crate) fn apply_cli_overrides(config: &mut config::Config, cli: &Cli) -> Opt
         }
         if let Some(ref model) = cli.elevenlabs_model {
             elevenlabs.model = model.clone();
+        }
+        if let Some(ref model) = cli.elevenlabs_realtime_model {
+            elevenlabs.realtime_model = model.clone();
         }
         if let Some(ref strategy) = cli.elevenlabs_commit_strategy {
             elevenlabs.commit_strategy = strategy
@@ -680,6 +684,7 @@ mod tests {
             ("VOXTYPE_ELEVENLABS_LANGUAGE", Some("  en  ")),
             ("VOXTYPE_ELEVENLABS_MODE", Some("partials")),
             ("VOXTYPE_ELEVENLABS_MODEL", Some("scribe_env")),
+            ("VOXTYPE_ELEVENLABS_REALTIME_MODEL", Some("scribe_env_live")),
             ("VOXTYPE_ELEVENLABS_COMMIT_STRATEGY", Some("manual")),
             ("VOXTYPE_ELEVENLABS_NO_VERBATIM", Some("true")),
             ("VOXTYPE_ELEVENLABS_VAD_SILENCE_THRESHOLD_SECS", Some("0.8")),
@@ -694,6 +699,7 @@ mod tests {
                 elevenlabs.language_code.as_deref(),
                 elevenlabs.mode,
                 elevenlabs.model.as_str(),
+                elevenlabs.realtime_model.as_str(),
                 elevenlabs.commit_strategy,
                 elevenlabs.no_verbatim,
                 elevenlabs.vad_silence_threshold_secs,
@@ -704,6 +710,7 @@ mod tests {
                 Some("en"),
                 config::ElevenLabsMode::Partials,
                 "scribe_env",
+                "scribe_env_live",
                 config::ElevenLabsCommitStrategy::Manual,
                 true,
                 0.8,
@@ -773,6 +780,7 @@ mod tests {
             ("VOXTYPE_ELEVENLABS_LANGUAGE", Some("fr")),
             ("VOXTYPE_ELEVENLABS_MODE", Some("batch")),
             ("VOXTYPE_ELEVENLABS_MODEL", Some("scribe_env")),
+            ("VOXTYPE_ELEVENLABS_REALTIME_MODEL", Some("scribe_env_live")),
             ("VOXTYPE_ELEVENLABS_COMMIT_STRATEGY", Some("vad")),
             ("VOXTYPE_ELEVENLABS_NO_VERBATIM", Some("false")),
             ("VOXTYPE_ELEVENLABS_VAD_SILENCE_THRESHOLD_SECS", Some("1.2")),
@@ -793,6 +801,8 @@ mod tests {
             "realtime",
             "--elevenlabs-model",
             "scribe_cli",
+            "--elevenlabs-realtime-model",
+            "scribe_cli_live",
             "--elevenlabs-commit-strategy",
             "manual",
             "--elevenlabs-no-verbatim",
@@ -813,6 +823,7 @@ mod tests {
                 elevenlabs.language_code.as_deref(),
                 elevenlabs.mode,
                 elevenlabs.model.as_str(),
+                elevenlabs.realtime_model.as_str(),
                 elevenlabs.commit_strategy,
                 elevenlabs.no_verbatim,
                 elevenlabs.vad_silence_threshold_secs,
@@ -824,6 +835,7 @@ mod tests {
                 Some("de"),
                 config::ElevenLabsMode::Realtime,
                 "scribe_cli",
+                "scribe_cli_live",
                 config::ElevenLabsCommitStrategy::Manual,
                 true,
                 0.6,
