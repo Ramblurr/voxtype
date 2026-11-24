@@ -75,6 +75,9 @@ pub struct StreamingSession {
     history_raw_partial: String,
     output_error: Option<String>,
     last_delivery: Option<Delivered>,
+    /// Delay between correction BackSpace key events, matching the
+    /// configured typing pace.
+    type_delay_ms: u32,
 }
 
 impl StreamingSession {
@@ -89,7 +92,16 @@ impl StreamingSession {
             history_raw_partial: String::new(),
             output_error: None,
             last_delivery: None,
+            type_delay_ms: 0,
         }
+    }
+
+    /// Pace correction BackSpace key events like typed text
+    /// (`output.type_delay_ms`). Fast bursts of BackSpace can outrun
+    /// applications that drop or reorder synthetic key events.
+    pub fn with_type_delay_ms(mut self, type_delay_ms: u32) -> Self {
+        self.type_delay_ms = type_delay_ms;
+        self
     }
 
     pub fn with_history_context(
@@ -288,7 +300,7 @@ impl StreamingSession {
                 let processed = tp.process_with_vocabulary(&raw, vocabulary);
                 if processed != raw {
                     let provisional_chars = self.partial.chars().count();
-                    let emitted = emit_backspaces(provisional_chars).await;
+                    let emitted = emit_backspaces(provisional_chars, self.type_delay_ms).await;
                     if emitted == provisional_chars {
                         let history_context = self.history_context.clone();
                         let opts = OutputOptions {
@@ -431,7 +443,7 @@ impl StreamingSession {
             .min(self.partial.chars().count())
             .min(self.typed_chars);
         if n > 0 {
-            let emitted = emit_backspaces(n).await;
+            let emitted = emit_backspaces(n, self.type_delay_ms).await;
             if emitted == 0 {
                 // No backspace-capable backend ran. The cursor still
                 // shows the old partial — DO NOT touch our bookkeeping,
@@ -504,7 +516,7 @@ impl StreamingSession {
             return Ok(());
         }
 
-        if emit_backspaces(count).await > 0 {
+        if emit_backspaces(count, self.type_delay_ms).await > 0 {
             self.typed_chars = 0;
             return Ok(());
         }
@@ -525,47 +537,85 @@ impl Default for StreamingSession {
     }
 }
 
-/// Backspace `count` chars using the first available method.
-/// Returns the actual number of backspaces emitted.
+/// Backspace `count` chars using the first available method, `delay_ms`
+/// apart. Returns the actual number of backspaces emitted.
 // Unit tests exercise bookkeeping with an in-memory output, never the real
 // focused application. Treat backspaces as successful in that test surface.
 #[cfg(test)]
-async fn emit_backspaces(count: usize) -> usize {
+async fn emit_backspaces(count: usize, _delay_ms: u32) -> usize {
     tests::BACKSPACES.with(|counts| counts.borrow_mut().push(count));
     count
 }
 
 #[cfg(not(test))]
-async fn emit_backspaces(count: usize) -> usize {
+async fn emit_backspaces(count: usize, delay_ms: u32) -> usize {
     if count == 0 {
         return 0;
     }
-    if try_wtype_backspaces(count).await {
+    if try_wtype_backspaces(count, delay_ms).await {
         return count;
     }
-    if try_dotool_backspaces(count).await {
+    if try_dotool_backspaces(count, delay_ms).await {
         return count;
     }
-    if try_ydotool_backspaces(count).await {
+    if try_ydotool_backspaces(count, delay_ms).await {
         return count;
     }
     0
 }
 
-#[cfg(not(test))]
-async fn try_wtype_backspaces(count: usize) -> bool {
-    // wtype invocation: `wtype -k BackSpace` repeated. Build args
-    // dynamically to send N keypresses in a single subprocess.
-    let mut cmd = Command::new("wtype");
+/// `wtype` arguments for `count` BackSpace presses in one subprocess,
+/// sleeping `delay_ms` before each.
+fn wtype_backspace_args(count: usize, delay_ms: u32) -> Vec<String> {
+    let mut args = Vec::with_capacity(count * 4);
     for _ in 0..count {
-        cmd.arg("-k").arg("BackSpace");
+        if delay_ms > 0 {
+            args.push("-s".to_string());
+            args.push(delay_ms.to_string());
+        }
+        args.push("-k".to_string());
+        args.push("BackSpace".to_string());
     }
+    args
+}
+
+/// dotool commands for `count` BackSpace presses, `delay_ms` apart.
+fn dotool_backspace_commands(count: usize, delay_ms: u32) -> String {
+    let mut commands = String::with_capacity(count * "key backspace\n".len() + 32);
+    if count > 0 && delay_ms > 0 {
+        commands.push_str(&format!("keydelay {delay_ms}\nkeyhold {delay_ms}\n"));
+    }
+    for _ in 0..count {
+        commands.push_str("key backspace\n");
+    }
+    commands
+}
+
+/// ydotool arguments for `count` BackSpace press+release pairs (Linux key
+/// code 14), `delay_ms` apart.
+fn ydotool_backspace_args(count: usize, delay_ms: u32) -> Vec<String> {
+    let mut args = vec!["key".to_string()];
+    if delay_ms > 0 {
+        args.push("-d".to_string());
+        args.push(delay_ms.to_string());
+    }
+    for _ in 0..count {
+        args.push("14:1".to_string());
+        args.push("14:0".to_string());
+    }
+    args
+}
+
+#[cfg(not(test))]
+async fn try_wtype_backspaces(count: usize, delay_ms: u32) -> bool {
+    let mut cmd = Command::new("wtype");
+    cmd.args(wtype_backspace_args(count, delay_ms));
     cmd.stdout(Stdio::null()).stderr(Stdio::null());
     matches!(cmd.status().await, Ok(s) if s.success())
 }
 
 #[cfg(not(test))]
-async fn try_dotool_backspaces(count: usize) -> bool {
+async fn try_dotool_backspaces(count: usize, delay_ms: u32) -> bool {
     // Prefer `dotoolc` whenever dotoold is actually accepting input.
     // Spawning raw `dotool` creates a *new* uinput keyboard per call;
     // KDE Plasma can drop events on the typing keyboard while these
@@ -588,10 +638,7 @@ async fn try_dotool_backspaces(count: usize) -> bool {
         Err(_) => return false,
     };
     if let Some(mut stdin) = child.stdin.take() {
-        let mut buf = String::with_capacity(count * "key backspace\n".len());
-        for _ in 0..count {
-            buf.push_str("key backspace\n");
-        }
+        let buf = dotool_backspace_commands(count, delay_ms);
         if stdin.write_all(buf.as_bytes()).await.is_err() {
             return false;
         }
@@ -601,14 +648,9 @@ async fn try_dotool_backspaces(count: usize) -> bool {
 }
 
 #[cfg(not(test))]
-async fn try_ydotool_backspaces(count: usize) -> bool {
-    // ydotool key 14:1 14:0 sends BackSpace press+release. Linux key
-    // codes: BackSpace = 14.
+async fn try_ydotool_backspaces(count: usize, delay_ms: u32) -> bool {
     let mut cmd = Command::new("ydotool");
-    cmd.arg("key");
-    for _ in 0..count {
-        cmd.arg("14:1").arg("14:0");
-    }
+    cmd.args(ydotool_backspace_args(count, delay_ms));
     cmd.stdout(Stdio::null()).stderr(Stdio::null());
     matches!(cmd.status().await, Ok(s) if s.success())
 }
@@ -1116,5 +1158,33 @@ mod tests {
         // Should succeed without spawning anything.
         session.rewind().await.unwrap();
         assert_eq!(session.typed_chars(), 0);
+    }
+
+    #[test]
+    fn backspace_commands_follow_the_typing_delay() {
+        assert_eq!(
+            wtype_backspace_args(2, 17),
+            ["-s", "17", "-k", "BackSpace", "-s", "17", "-k", "BackSpace"]
+        );
+        assert_eq!(
+            wtype_backspace_args(2, 0),
+            ["-k", "BackSpace", "-k", "BackSpace"]
+        );
+        assert_eq!(
+            dotool_backspace_commands(2, 17),
+            "keydelay 17\nkeyhold 17\nkey backspace\nkey backspace\n"
+        );
+        assert_eq!(
+            dotool_backspace_commands(2, 0),
+            "key backspace\nkey backspace\n"
+        );
+        assert_eq!(
+            ydotool_backspace_args(2, 17),
+            ["key", "-d", "17", "14:1", "14:0", "14:1", "14:0"]
+        );
+        assert_eq!(
+            ydotool_backspace_args(2, 0),
+            ["key", "14:1", "14:0", "14:1", "14:0"]
+        );
     }
 }
