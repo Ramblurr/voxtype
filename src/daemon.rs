@@ -2387,8 +2387,11 @@ impl Daemon {
         self.begin_osd_session(state);
         self.active_transcriber = Some(transcriber);
         self.history_note(|pending| pending.transcribing(0));
-        *streaming_session =
-            Some(StreamingSession::new().with_history_context(self.history_context()));
+        *streaming_session = Some(
+            StreamingSession::new()
+                .with_history_context(self.history_context())
+                .with_type_delay_ms(output_config.type_delay_ms),
+        );
         self.play_feedback(SoundEvent::RecordingStart);
 
         if let Some(cmd) = &self.config.output.pre_recording_command {
