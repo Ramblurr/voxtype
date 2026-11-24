@@ -3458,7 +3458,8 @@ impl Daemon {
                 | crate::config::TranscriptionEngine::Cohere
                 | crate::config::TranscriptionEngine::Gguf
                 | crate::config::TranscriptionEngine::OpenVino
-                | crate::config::TranscriptionEngine::Soniox => {
+                | crate::config::TranscriptionEngine::Soniox
+                | crate::config::TranscriptionEngine::ElevenLabs => {
                     let config = self.config.clone();
                     let vocabulary = vocabulary.clone();
                     self.model_load_task = Some(tokio::task::spawn_blocking(move || {
@@ -3494,7 +3495,8 @@ impl Daemon {
                 | crate::config::TranscriptionEngine::Cohere
                 | crate::config::TranscriptionEngine::Gguf
                 | crate::config::TranscriptionEngine::OpenVino
-                | crate::config::TranscriptionEngine::Soniox => {
+                | crate::config::TranscriptionEngine::Soniox
+                | crate::config::TranscriptionEngine::ElevenLabs => {
                     if let Some(ref t) = self.transcriber_preloaded {
                         let transcriber = t.clone();
                         transcriber.set_vocabulary(&vocabulary);
@@ -3900,7 +3902,8 @@ impl Daemon {
                 | crate::config::TranscriptionEngine::Cohere
                 | crate::config::TranscriptionEngine::Gguf
                 | crate::config::TranscriptionEngine::OpenVino
-                | crate::config::TranscriptionEngine::Soniox => {
+                | crate::config::TranscriptionEngine::Soniox
+                | crate::config::TranscriptionEngine::ElevenLabs => {
                     if let Some(t) = self.transcriber_preloaded.clone() {
                         t.set_vocabulary(&vocabulary);
                         Ok(t)
@@ -6433,7 +6436,8 @@ impl Daemon {
             | crate::config::TranscriptionEngine::Cohere
             | crate::config::TranscriptionEngine::Gguf
             | crate::config::TranscriptionEngine::OpenVino
-            | crate::config::TranscriptionEngine::Soniox => {
+            | crate::config::TranscriptionEngine::Soniox
+            | crate::config::TranscriptionEngine::ElevenLabs => {
                 // Non-Whisper engines do their own setup; Soniox just validates
                 // API key + endpoint at construction (no model to download).
                 self.transcriber_preloaded = Some(Arc::from(
