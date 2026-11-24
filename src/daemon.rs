@@ -551,6 +551,17 @@ fn apply_output_override(
     config
 }
 
+/// Whether stopping a streaming session should drop its typing surface.
+///
+/// Most backends get the surface dropped so late text is not typed into
+/// whatever window has focus by then; `end_streaming` delivers it through the
+/// batch output path instead. ElevenLabs commits the last segment explicitly
+/// when the input stops and drains that commit within a bounded time, so its
+/// surface stays attached long enough to type the final phrase in place.
+fn disowns_streaming_output_on_stop(engine: crate::config::TranscriptionEngine) -> bool {
+    engine != crate::config::TranscriptionEngine::ElevenLabs
+}
+
 /// Every override file a single recording can carry, in the runtime dir.
 const RECORDING_OVERRIDE_FILES: [&str; 6] = [
     "output_mode_override",
@@ -2372,6 +2383,40 @@ impl Daemon {
         let file_output_path = self.resolve_file_output_path(&output_override, None);
         let output_config = apply_output_override(&self.config.output, output_override);
 
+        if self.config.engine == crate::config::TranscriptionEngine::ElevenLabs {
+            let profile_post_process = self
+                .recording_profile()
+                .and_then(|name| self.config.get_profile(&name))
+                .is_some_and(|profile| profile.post_process_command.is_some());
+            if let Err(error) = crate::transcribe::validate_elevenlabs_realtime_output(
+                &output_config,
+                profile_post_process,
+            ) {
+                tracing::error!("Cannot start ElevenLabs realtime transcription: {error}");
+                let _ = handle.cancel.send(());
+                handle.task.abort();
+                self.disarm_dead_input_guard();
+                self.cut_streaming_audio();
+                self.end_external_session(false).await;
+                let mut c = capture;
+                let _ = c.stop().await;
+                self.restore_recording_media();
+                self.discard_recording_overrides();
+                self.play_feedback(SoundEvent::Error);
+                send_notification(
+                    "ElevenLabs Realtime Unavailable",
+                    &error.to_string(),
+                    self.config.output.notification.show_engine_icon,
+                    self.config.engine,
+                    "critical",
+                )
+                .await;
+                // Handled: falling back to batch would silently ignore the
+                // configured mode.
+                return true;
+            }
+        }
+
         *audio_capture = Some(capture);
         *streaming_handle = Some(handle);
         *streaming_chain = Some(output::create_output_chain(&output_config));
@@ -2464,8 +2509,9 @@ impl Daemon {
         self.end_external_session(state.is_recording()).await;
 
         if state.is_streaming() {
-            tracing::info!("Stopping streaming session; closing capture and disowning output");
-            self.request_streaming_stop(audio_capture, streaming_chain, true)
+            let disown_output = disowns_streaming_output_on_stop(self.config.engine);
+            tracing::info!(disown_output, "Stopping streaming session; closing capture");
+            self.request_streaming_stop(audio_capture, streaming_chain, disown_output)
                 .await;
         } else if let State::Recording { model_override, .. } = &*state {
             let model_override = model_override.clone();
@@ -2893,9 +2939,9 @@ impl Daemon {
     /// run the capture's retained audio through batch transcription and
     /// the ordinary batch result path.
     ///
-    /// A cloud engine (Soniox) that just lost its connection is the least
-    /// likely thing to transcribe this audio, so it recovers with the
-    /// configured `[whisper]` backend first. A local engine recovers with
+    /// A cloud engine (Soniox, ElevenLabs) that just lost its connection is
+    /// the least likely thing to transcribe this audio, so it recovers with
+    /// the configured `[whisper]` backend first. A local engine recovers with
     /// its own batch path, which is already loaded. Either way the other
     /// one is the fallback, because any transcript beats losing it.
     async fn recover_streaming_audio(
@@ -2940,7 +2986,11 @@ impl Daemon {
             }
         }
 
-        let prefer_whisper = self.config.engine == crate::config::TranscriptionEngine::Soniox;
+        let prefer_whisper = matches!(
+            self.config.engine,
+            crate::config::TranscriptionEngine::Soniox
+                | crate::config::TranscriptionEngine::ElevenLabs
+        );
         let fallback = if prefer_whisper { "Whisper" } else { "batch" };
         tracing::warn!(
             "Streaming session ended without text; recovering {:.1}s with {} transcription",
@@ -6586,9 +6636,11 @@ impl Daemon {
         // (Hyprland, Sway, River) those synthetic key events clobber the held-
         // key state tracker, so the physical key release never fires bindrd and
         // the daemon gets stuck in streaming. Force toggle activation when
-        // streaming is enabled. The user's config file is left untouched; this
-        // override only applies to the running daemon.
-        if self.config.streaming_active()
+        // streaming is enabled, unless the backend is known to work with the
+        // built-in evdev listener (see `streaming_requires_toggle_activation`).
+        // The user's config file is left untouched; this override only applies
+        // to the running daemon.
+        if self.config.streaming_requires_toggle_activation()
             && self.config.hotkey.mode == crate::config::ActivationMode::PushToTalk
         {
             tracing::warn!(
@@ -7075,7 +7127,7 @@ impl Daemon {
                                 self.request_streaming_stop(
                                     &mut audio_capture,
                                     &mut streaming_chain,
-                                    true,
+                                    disowns_streaming_output_on_stop(self.config.engine),
                                 )
                                 .await;
                             } else if let State::Recording { model_override, .. } = &state {
@@ -10700,6 +10752,33 @@ while True:
 
         assert!(daemon.transcription_task.is_none());
         assert!(state.is_idle());
+    }
+
+    /// ElevenLabs commits its last segment when the input stops, so a stop
+    /// keeps the typing surface attached for that final phrase. Other
+    /// streaming backends drop it.
+    #[tokio::test]
+    async fn signal_stop_keeps_the_typing_surface_only_for_elevenlabs() {
+        for (engine, keeps_surface) in [
+            (TranscriptionEngine::ElevenLabs, true),
+            (TranscriptionEngine::Soniox, false),
+        ] {
+            let mut config = Config {
+                engine,
+                ..Config::default()
+            };
+            config.audio.feedback.enabled = false;
+            let mut daemon = Daemon::new(config, None);
+            let mut state = non_file_streaming_state();
+            let mut chain: Option<Vec<Box<dyn TextOutput>>> = Some(Vec::new());
+
+            daemon
+                .stop_active_recording(&mut state, &mut None, &mut chain, &mut None)
+                .await;
+
+            assert_eq!(chain.is_some(), keeps_surface, "{engine}");
+            assert!(daemon.streaming_stop_deadline.is_some(), "{engine}");
+        }
     }
 
     /// #1004: a start sent while the last dictation was being delivered is

@@ -284,8 +284,23 @@ impl Config {
             TranscriptionEngine::OpenVino => {
                 self.openvino.as_ref().map(|o| o.streaming).unwrap_or(false)
             }
+            TranscriptionEngine::ElevenLabs => self
+                .elevenlabs
+                .as_ref()
+                .map(ElevenLabsConfig::uses_realtime_api)
+                .unwrap_or(false),
             _ => false,
         }
+    }
+
+    /// Returns true when startup must replace push-to-talk with toggle mode.
+    ///
+    /// ElevenLabs can keep push-to-talk when the built-in hotkey listener reads
+    /// raw evdev events. Synthetic output cannot hide the physical release from
+    /// that listener. Compositor-managed release bindings still require toggle.
+    pub fn streaming_requires_toggle_activation(&self) -> bool {
+        self.streaming_active()
+            && !(self.engine == TranscriptionEngine::ElevenLabs && self.hotkey.enabled)
     }
 
     /// Clone this config for meeting (long-form) transcription: the
@@ -1005,7 +1020,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::super::hotkey::default_hotkey_key;
-    use super::super::{ActivationMode, OutputMode};
+    use super::super::{ActivationMode, ElevenLabsMode, OutputMode};
     use super::*;
 
     #[test]
@@ -1819,6 +1834,42 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn elevenlabs_streaming_active_follows_mode() {
+        let mut config = Config {
+            engine: TranscriptionEngine::ElevenLabs,
+            ..Config::default()
+        };
+        assert!(!config.streaming_active());
+
+        config.elevenlabs = Some(ElevenLabsConfig::default());
+        assert!(config.streaming_active());
+
+        config.elevenlabs.as_mut().unwrap().mode = ElevenLabsMode::Partials;
+        assert!(config.streaming_active());
+
+        config.elevenlabs.as_mut().unwrap().mode = ElevenLabsMode::Batch;
+        assert!(!config.streaming_active());
+    }
+
+    #[test]
+    fn elevenlabs_streaming_ptt_requires_toggle_only_for_external_hotkeys() {
+        let mut config = Config {
+            engine: TranscriptionEngine::ElevenLabs,
+            elevenlabs: Some(ElevenLabsConfig::default()),
+            ..Config::default()
+        };
+
+        assert!(config.streaming_active());
+        assert!(!config.streaming_requires_toggle_activation());
+
+        config.hotkey.enabled = false;
+        assert!(config.streaming_requires_toggle_activation());
+
+        config.elevenlabs.as_mut().unwrap().mode = ElevenLabsMode::Batch;
+        assert!(!config.streaming_requires_toggle_activation());
     }
 
     #[test]
